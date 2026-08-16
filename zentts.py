@@ -12,7 +12,7 @@ Copyright (c) 2026 Omor. All rights reserved.
 Proprietary software - see LICENSE. Third-party notices in NOTICE.md.
 """
 
-__version__ = "1.3.3"
+__version__ = "1.3.4"
 __author__ = "Omor"
 __license__ = "Proprietary"
 __url__ = "https://github.com/OmorDeveloper/zentts"
@@ -941,6 +941,7 @@ Commands:
     --help-languages   List all supported languages
     --help-voices      List all available voices
     --download         Download the ZenTTS model files and exit
+    --uninstall        Remove the ZenTTS cache and data files
     --license          Show whether this install is licensed to run
     --merge-chunks     Merge existing chunks in split-output directory into chapter files
 
@@ -2164,6 +2165,7 @@ def get_valid_options():
         "--help-languages",
         "--help-voices",
         "--download",
+        "--uninstall",
         "--merge-chunks",
         "--stream",
         "--speed",
@@ -3559,6 +3561,22 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] in ("start", "serve"):
         start_command(sys.argv[2:])
         return
+
+    if len(sys.argv) > 1 and sys.argv[1] == "uninstall":
+        import shutil
+        import subprocess
+
+        cache = model_dir()
+        print(f"Removing ZenTTS cache: {cache}")
+        if cache.exists():
+            shutil.rmtree(cache, ignore_errors=True)
+            print("  Cache removed.")
+        else:
+            print("  Cache was already empty.")
+
+        print("\nTo remove the package itself:")
+        print(f"  pip uninstall -y zentts")
+        sys.exit(0)
 
     valid_options = get_valid_options()
 

@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.3.4
+
+- **Add `zentts uninstall` command.** Removes the ZenTTS cache directory
+  (model files, sessions, licence state) and instructs the user how to remove
+  the package itself with `pip uninstall -y zentts`.
+- **Drop `.python-version` pin.** The repo no longer forces 3.12; any 3.11+
+  interpreter works.
+
 ## 1.3.3
 
 - **Fix Termux/Android install.** Lowered the `espeakng-loader` minimum from
