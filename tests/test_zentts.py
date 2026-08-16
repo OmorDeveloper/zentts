@@ -9,6 +9,7 @@ import hashlib
 import io
 import re
 import sys
+import time
 import urllib.error
 from pathlib import Path
 
@@ -19,6 +20,12 @@ import soundfile as sf
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import zentts
+
+
+@pytest.fixture(autouse=True)
+def _skip_license_check(monkeypatch):
+    """Keep the suite offline; the licence logic is tested on its own."""
+    monkeypatch.setenv("ZENTTS_SKIP_LICENSE_CHECK", "1")
 
 
 ##############################################################################
@@ -641,8 +648,12 @@ def test_server_serves_speech_end_to_end(engine, tmp_path):
         with urllib.request.urlopen(f"{base}/v1/models", timeout=10) as response:
             assert "tts-1" in [m["id"] for m in _json.load(response)["data"]]
 
-        with urllib.request.urlopen(f"{base}/", timeout=10) as response:
+        with urllib.request.urlopen(f"{base}/api", timeout=10) as response:
             assert "POST /v1/audio/speech" in _json.load(response)["endpoints"]
+
+        with urllib.request.urlopen(f"{base}/", timeout=10) as response:
+            assert response.headers["Content-Type"].startswith("text/html")
+            assert "ZenTTS Studio" in response.read().decode()
 
         # An OpenAI voice name and the default mp3 format.
         with post({"model": "tts-1", "input": "Hello.", "voice": "nova"}) as response:
@@ -680,3 +691,237 @@ def test_server_serves_speech_end_to_end(engine, tmp_path):
         httpd.shutdown()
         httpd.server_close()
         thread.join(timeout=10)
+
+
+##############################################################################
+# Sessions and history
+##############################################################################
+
+
+@pytest.fixture()
+def store(monkeypatch, tmp_path):
+    monkeypatch.setenv("ZENTTS_HOME", str(tmp_path))
+    return tmp_path
+
+
+def _meta(text="hello"):
+    return {
+        "text": text,
+        "voice": zentts.DEFAULT_VOICE,
+        "format": "mp3",
+        "speed": 1.0,
+        "language": "en-us",
+        "seconds": 1.0,
+    }
+
+
+def test_new_session_is_stored_and_listed(store):
+    session = zentts.new_session("My book")
+    assert session["name"] == "My book"
+    assert zentts.load_session(session["id"])["name"] == "My book"
+    assert [s["id"] for s in zentts.list_sessions()] == [session["id"]]
+
+
+def test_sessions_are_listed_newest_first(store):
+    first = zentts.new_session("one")
+    time.sleep(0.01)
+    second = zentts.new_session("two")
+    assert [s["id"] for s in zentts.list_sessions()] == [second["id"], first["id"]]
+
+
+def test_rename_session(store):
+    session = zentts.new_session("before")
+    assert zentts.rename_session(session["id"], "after")["name"] == "after"
+    assert zentts.load_session(session["id"])["name"] == "after"
+
+
+def test_rename_session_rejects_an_empty_name(store):
+    session = zentts.new_session()
+    with pytest.raises(ValueError):
+        zentts.rename_session(session["id"], "   ")
+
+
+def test_rename_unknown_session_returns_none(store):
+    assert zentts.rename_session("snope", "x") is None
+
+
+def test_delete_session_removes_its_audio(store):
+    session = zentts.new_session()
+    item = zentts.add_session_item(session["id"], b"audio-bytes", _meta())
+    audio = zentts.sessions_dir() / "audio" / item["file"]
+    assert audio.exists()
+
+    assert zentts.delete_session(session["id"]) is True
+    assert not audio.exists()
+    assert zentts.load_session(session["id"]) is None
+    assert zentts.delete_session(session["id"]) is False
+
+
+def test_add_session_item_records_history(store):
+    session = zentts.new_session()
+    item = zentts.add_session_item(session["id"], b"12345", _meta("spoken text"))
+
+    assert item["bytes"] == 5
+    stored = zentts.load_session(session["id"])["items"]
+    assert len(stored) == 1
+    assert stored[0]["text"] == "spoken text"
+
+    path, found = zentts.session_item_path(session["id"], item["id"])
+    assert path.read_bytes() == b"12345"
+    assert found["id"] == item["id"]
+
+
+def test_history_is_capped(store, monkeypatch):
+    monkeypatch.setattr(zentts, "MAX_SESSION_ITEMS", 3)
+    session = zentts.new_session()
+    for index in range(5):
+        zentts.add_session_item(session["id"], b"x", _meta(f"line {index}"))
+
+    items = zentts.load_session(session["id"])["items"]
+    assert len(items) == 3
+    assert [i["text"] for i in items] == ["line 2", "line 3", "line 4"]
+    kept = {i["file"] for i in items}
+    on_disk = {p.name for p in (zentts.sessions_dir() / "audio").iterdir()}
+    assert on_disk == kept
+
+
+def test_session_ids_cannot_escape_the_directory(store):
+    for bad in ["../secret", "a/b", "..", ""]:
+        with pytest.raises(ValueError):
+            zentts.load_session(bad)
+
+
+##############################################################################
+# Licence control
+##############################################################################
+
+
+@pytest.fixture()
+def licensing(monkeypatch, tmp_path):
+    monkeypatch.setenv("ZENTTS_HOME", str(tmp_path))
+    monkeypatch.delenv("ZENTTS_SKIP_LICENSE_CHECK", raising=False)
+    return tmp_path
+
+
+def _offline(monkeypatch):
+    def boom(*args, **kwargs):
+        raise OSError("offline")
+
+    monkeypatch.setattr(zentts, "_fetch_json", boom)
+
+
+def _control(monkeypatch, payload, package_ok=True):
+    def fake(url, timeout=8):
+        if "pypi.org" in url:
+            if not package_ok:
+                raise urllib.error.HTTPError(url, 404, "gone", {}, None)
+            return {"info": {"version": zentts.__version__}}
+        return payload
+
+    monkeypatch.setattr(zentts, "_fetch_json", fake)
+
+
+def test_license_allows_an_enabled_install(licensing, monkeypatch):
+    _control(monkeypatch, {"enabled": True})
+    assert zentts.check_license(force=True)[0]
+
+
+def test_license_kill_switch_disables_the_install(licensing, monkeypatch):
+    _control(monkeypatch, {"enabled": False, "message": "Shut down by the author."})
+    allowed, message = zentts.check_license(force=True)
+    assert not allowed
+    assert message == "Shut down by the author."
+
+    # The refusal is remembered, so it survives going offline.
+    _offline(monkeypatch)
+    allowed, message = zentts.check_license(force=True)
+    assert not allowed
+    assert "Shut down" in message
+
+
+def test_license_blocks_a_withdrawn_version(licensing, monkeypatch):
+    _control(monkeypatch, {"enabled": True, "blocked_versions": [zentts.__version__]})
+    allowed, message = zentts.check_license(force=True)
+    assert not allowed
+    assert "withdrawn" in message
+
+
+def test_license_enforces_a_minimum_version(licensing, monkeypatch):
+    _control(monkeypatch, {"enabled": True, "min_version": "99.0.0"})
+    allowed, message = zentts.check_license(force=True)
+    assert not allowed
+    assert "no longer supported" in message
+
+
+def test_license_stops_when_the_package_is_unpublished(licensing, monkeypatch):
+    _control(monkeypatch, {"enabled": True}, package_ok=False)
+    allowed, message = zentts.check_license(force=True)
+    assert not allowed
+    assert "no longer published" in message
+
+
+def test_license_refuses_a_first_run_with_no_network(licensing, monkeypatch):
+    _offline(monkeypatch)
+    allowed, message = zentts.check_license(force=True)
+    assert not allowed
+    assert "never checked in" in message
+
+
+def test_license_allows_a_short_offline_spell(licensing, monkeypatch):
+    _control(monkeypatch, {"enabled": True})
+    assert zentts.check_license(force=True)[0]
+
+    _offline(monkeypatch)
+    allowed, message = zentts.check_license(force=True)
+    assert allowed
+    assert "grace" in message
+
+
+def test_license_stops_after_too_long_offline(licensing, monkeypatch):
+    _control(monkeypatch, {"enabled": True})
+    zentts.check_license(force=True)
+
+    state = zentts._read_license_state()
+    state["checked_at"] = time.time() - (zentts.LICENSE_GRACE_DAYS + 1) * 86400
+    zentts._write_license_state(state)
+
+    _offline(monkeypatch)
+    allowed, message = zentts.check_license(force=True)
+    assert not allowed
+    assert "offline" in message
+
+
+def test_license_check_is_cached(licensing, monkeypatch):
+    calls = []
+
+    def counting(url, timeout=8):
+        calls.append(url)
+        return {"enabled": True} if "pypi" not in url else {"info": {}}
+
+    monkeypatch.setattr(zentts, "_fetch_json", counting)
+    zentts.check_license(force=True)
+    before = len(calls)
+    zentts.check_license()  # inside the cache window
+    assert len(calls) == before
+
+
+def test_version_tuple_orders_releases():
+    assert zentts._version_tuple("1.2.0") > zentts._version_tuple("1.1.9")
+    assert zentts._version_tuple("1.10.0") > zentts._version_tuple("1.9.0")
+
+
+##############################################################################
+# Web interface
+##############################################################################
+
+
+def test_web_ui_is_self_contained():
+    assert "ZenTTS Studio" in zentts.WEB_UI
+    assert "<script" in zentts.WEB_UI
+    # No external hosts: the page must work with no internet at all.
+    assert "https://" not in zentts.WEB_UI
+
+
+def test_web_ui_covers_the_session_actions():
+    for fragment in ["/v1/sessions", "PATCH", "DELETE", "/v1/logs", "/v1/voices"]:
+        assert fragment in zentts.WEB_UI

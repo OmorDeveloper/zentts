@@ -19,6 +19,7 @@ __url__ = "https://github.com/OmorDeveloper/zentts"
 
 # Standard library imports
 import asyncio
+import collections
 import ctypes
 import ctypes.util
 import difflib
@@ -775,6 +776,8 @@ def _filter_english_languages(languages):
 
 def load_engine(model_path=None, voices_path=None):
     """Resolve the model files (downloading on first run) and load the engine."""
+    require_license()
+
     try:
         model, voices = resolve_model_files(model_path, voices_path)
     except (FileNotFoundError, RuntimeError) as e:
@@ -938,6 +941,7 @@ Commands:
     --help-languages   List all supported languages
     --help-voices      List all available voices
     --download         Download the ZenTTS model files and exit
+    --license          Show whether this install is licensed to run
     --merge-chunks     Merge existing chunks in split-output directory into chapter files
 
 Options:
@@ -2178,12 +2182,331 @@ def get_valid_options():
         "--default-voice",
         "--no-cors",
         "--quiet",
+        "--license",
     }
+
+
+##############################################################################
+# Licence control (admin kill switch)
+##############################################################################
+
+# The admin controls this file. Setting "enabled" to false stops every install
+# that can reach it. Override for testing with ZENTTS_LICENSE_URL.
+LICENSE_CONTROL_URL = (
+    "https://raw.githubusercontent.com/OmorDeveloper/zentts/master/control.json"
+)
+
+# The package must still exist on PyPI; a yanked or deleted project is a kill.
+LICENSE_PACKAGE_URL = "https://pypi.org/pypi/zentts/json"
+
+# How long an install may run on the last good check before it stops.
+LICENSE_GRACE_DAYS = 7
+
+# How often to check again once a check has succeeded.
+LICENSE_CHECK_HOURS = 12
+
+
+def license_state_path():
+    return model_dir() / "license.json"
+
+
+def _read_license_state():
+    try:
+        with open(license_state_path(), encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _write_license_state(state):
+    try:
+        license_state_path().parent.mkdir(parents=True, exist_ok=True)
+        with open(license_state_path(), "w", encoding="utf-8") as fh:
+            json.dump(state, fh, indent=2)
+    except OSError as e:
+        log.debug(f"Could not store the licence state: {e}")
+
+
+def _fetch_json(url, timeout=8):
+    request = urllib.request.Request(url, headers={"User-Agent": f"zentts/{__version__}"})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _version_tuple(text):
+    parts = []
+    for piece in str(text).split("."):
+        digits = "".join(c for c in piece if c.isdigit())
+        parts.append(int(digits) if digits else 0)
+    return tuple(parts + [0, 0, 0])[:3]
+
+
+def check_license(force=False, quiet=True):
+    """Ask the control file whether this install may run.
+
+    Returns (allowed, message). The result is cached, so a normal run does not
+    call out on every invocation. When the check cannot be made, the install
+    keeps working until the grace period since the last good check runs out.
+    """
+    if os.getenv("ZENTTS_SKIP_LICENSE_CHECK"):
+        return True, "licence check skipped by environment"
+
+    state = _read_license_state()
+    now = time.time()
+
+    if state.get("disabled"):
+        return False, state.get("message") or "This copy of ZenTTS has been disabled."
+
+    checked_at = float(state.get("checked_at") or 0)
+    if not force and now - checked_at < LICENSE_CHECK_HOURS * 3600:
+        return True, "using the cached licence check"
+
+    url = os.getenv("ZENTTS_LICENSE_URL", LICENSE_CONTROL_URL)
+    try:
+        control = _fetch_json(url)
+        if not isinstance(control, dict):
+            raise ValueError("control file is not an object")
+
+        if not control.get("enabled", True):
+            message = control.get("message") or "This copy of ZenTTS has been disabled."
+            _write_license_state(
+                {"disabled": True, "message": message, "checked_at": now}
+            )
+            return False, message
+
+        minimum = control.get("min_version")
+        if minimum and _version_tuple(__version__) < _version_tuple(minimum):
+            message = control.get("outdated_message") or (
+                f"ZenTTS {__version__} is no longer supported. "
+                f"Upgrade to {minimum} or later: pip install --upgrade zentts"
+            )
+            return False, message
+
+        if __version__ in (control.get("blocked_versions") or []):
+            message = control.get("message") or (
+                f"ZenTTS {__version__} has been withdrawn. "
+                "Run: pip install --upgrade zentts"
+            )
+            return False, message
+
+        # The package itself must still be published.
+        if control.get("require_package", True):
+            try:
+                _fetch_json(LICENSE_PACKAGE_URL)
+            except urllib.error.HTTPError as e:
+                if e.code == 404:
+                    message = "The zentts package is no longer published, so it will not run."
+                    _write_license_state(
+                        {"disabled": True, "message": message, "checked_at": now}
+                    )
+                    return False, message
+                raise
+
+        _write_license_state({"disabled": False, "checked_at": now})
+        return True, "licence check passed"
+
+    except (urllib.error.URLError, OSError, ValueError, json.JSONDecodeError) as e:
+        # Offline. Run on the last good check until the grace period expires.
+        if not checked_at:
+            return False, (
+                "ZenTTS could not verify its licence and has never checked in "
+                f"successfully ({e}). Connect to the internet once to activate it."
+            )
+        days = (now - checked_at) / 86400
+        if days > LICENSE_GRACE_DAYS:
+            return False, (
+                f"ZenTTS has been offline for {days:.0f} days, past the "
+                f"{LICENSE_GRACE_DAYS} day limit. Connect to the internet to continue."
+            )
+        if not quiet:
+            print(f"Note: licence check skipped, offline for {days:.1f} days")
+        return True, f"offline, {LICENSE_GRACE_DAYS - days:.1f} days of grace left"
+
+
+def require_license():
+    """Stop the program unless this install is allowed to run."""
+    allowed, message = check_license()
+    if not allowed:
+        print("\nZenTTS is not available.\n")
+        print(f"  {message}\n")
+        sys.exit(2)
+
+
+##############################################################################
+# Sessions, history and logs
+##############################################################################
+
+# Requests kept in memory for the browser log view.
+REQUEST_LOG = collections.deque(maxlen=500)
+
+# Cap on stored audio, so history cannot fill a disk unnoticed.
+MAX_SESSION_ITEMS = 500
+
+
+def sessions_dir():
+    return model_dir() / "sessions"
+
+
+def _session_path(session_id):
+    return sessions_dir() / f"{session_id}.json"
+
+
+def _safe_session_id(session_id):
+    """Reject anything that is not a plain id, so paths cannot escape."""
+    session_id = str(session_id or "")
+    if not session_id or not all(c.isalnum() or c in "-_" for c in session_id):
+        raise ValueError(f"Invalid session id: {session_id}")
+    return session_id
+
+
+def new_session(name=None):
+    """Create a session and write it to disk."""
+    session_id = f"s{int(time.time() * 1000):x}{os.urandom(2).hex()}"
+    session = {
+        "id": session_id,
+        "name": name or time.strftime("Session %Y-%m-%d %H:%M"),
+        "created": time.time(),
+        "updated": time.time(),
+        "items": [],
+    }
+    save_session(session)
+    return session
+
+
+def save_session(session):
+    directory = sessions_dir()
+    directory.mkdir(parents=True, exist_ok=True)
+    session["updated"] = time.time()
+    path = _session_path(session["id"])
+    tmp = path.with_suffix(".json.tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(session, fh, indent=2)
+    tmp.replace(path)
+    return session
+
+
+def load_session(session_id):
+    path = _session_path(_safe_session_id(session_id))
+    if not path.exists():
+        return None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def list_sessions():
+    """Every session, newest first, without the item bodies."""
+    directory = sessions_dir()
+    if not directory.exists():
+        return []
+
+    sessions = []
+    for path in directory.glob("*.json"):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                session = json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            continue
+        sessions.append(
+            {
+                "id": session.get("id", path.stem),
+                "name": session.get("name", path.stem),
+                "created": session.get("created", 0),
+                "updated": session.get("updated", 0),
+                "items": len(session.get("items", [])),
+            }
+        )
+    return sorted(sessions, key=lambda s: s["updated"], reverse=True)
+
+
+def delete_session(session_id):
+    """Remove a session and every audio file it owns."""
+    session = load_session(session_id)
+    if not session:
+        return False
+
+    for item in session.get("items", []):
+        audio = sessions_dir() / "audio" / item.get("file", "")
+        if item.get("file"):
+            try:
+                audio.unlink(missing_ok=True)
+            except OSError as e:
+                log.debug(f"Could not delete {audio}: {e}")
+
+    _session_path(session["id"]).unlink(missing_ok=True)
+    return True
+
+
+def rename_session(session_id, name):
+    session = load_session(session_id)
+    if not session:
+        return None
+    name = str(name).strip()
+    if not name:
+        raise ValueError("Name cannot be empty")
+    session["name"] = name[:200]
+    return save_session(session)
+
+
+def add_session_item(session_id, audio, meta):
+    """Store one generated clip in a session and return its record."""
+    session = load_session(session_id)
+    if not session:
+        return None
+
+    audio_dir = sessions_dir() / "audio"
+    audio_dir.mkdir(parents=True, exist_ok=True)
+
+    item_id = f"i{int(time.time() * 1000):x}{os.urandom(2).hex()}"
+    filename = f"{session['id']}_{item_id}.{meta['format']}"
+    with open(audio_dir / filename, "wb") as fh:
+        fh.write(audio)
+
+    item = {
+        "id": item_id,
+        "created": time.time(),
+        "text": meta["text"][:5000],
+        "voice": meta["voice"],
+        "format": meta["format"],
+        "speed": meta["speed"],
+        "language": meta["language"],
+        "seconds": meta.get("seconds", 0),
+        "bytes": len(audio),
+        "file": filename,
+    }
+
+    session.setdefault("items", []).append(item)
+
+    # Keep history bounded, oldest first.
+    while len(session["items"]) > MAX_SESSION_ITEMS:
+        dropped = session["items"].pop(0)
+        if dropped.get("file"):
+            try:
+                (audio_dir / dropped["file"]).unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    save_session(session)
+    return item
+
+
+def session_item_path(session_id, item_id):
+    """Locate the audio file for one history item."""
+    session = load_session(session_id)
+    if not session:
+        return None, None
+    for item in session.get("items", []):
+        if item["id"] == item_id:
+            return sessions_dir() / "audio" / item["file"], item
+    return None, None
 
 
 ##############################################################################
 # HTTP server (OpenAI-compatible)
 ##############################################################################
+
 
 # Default address for `zentts start`.
 SERVER_HOST = "127.0.0.1"
@@ -2208,6 +2531,9 @@ OPENAI_VOICE_ALIASES = {
     "shimmer": "zen_us_f11",
     "verse": "zen_us_m05",
 }
+
+# Formats whose encoded chunks can simply follow one another in a stream.
+STREAMABLE_FORMATS = {"mp3", "pcm"}
 
 # Largest request body accepted, so a bad client cannot exhaust memory.
 MAX_REQUEST_BYTES = 10 * 1024 * 1024
@@ -2299,8 +2625,304 @@ def synthesize(engine, text, voice, speed=1.0, lang="en-us"):
     return np.concatenate(pieces), SAMPLE_RATE
 
 
+##############################################################################
+# Web interface
+##############################################################################
+
+WEB_UI = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ZenTTS Studio</title>
+<style>
+:root{--bg:#f6f7f9;--panel:#fff;--ink:#16181d;--muted:#666d7a;--line:#e2e5ea;
+--accent:#3d5afe;--accent-ink:#fff;--danger:#c0392b;--radius:10px}
+@media (prefers-color-scheme:dark){:root{--bg:#14161a;--panel:#1c1f25;--ink:#e8eaee;
+--muted:#98a0ad;--line:#2a2f38;--accent:#6f86ff;--accent-ink:#0d0f13}}
+*{box-sizing:border-box}
+body{margin:0;font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+background:var(--bg);color:var(--ink)}
+header{display:flex;align-items:baseline;gap:12px;padding:14px 20px;
+border-bottom:1px solid var(--line);background:var(--panel);position:sticky;top:0;z-index:5}
+header h1{font-size:17px;margin:0;letter-spacing:.2px}
+header .by{color:var(--muted);font-size:13px}
+header .spacer{flex:1}
+.layout{display:grid;grid-template-columns:250px 1fr;gap:18px;padding:18px;
+max-width:1200px;margin:0 auto;align-items:start}
+@media (max-width:820px){.layout{grid-template-columns:1fr}}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:14px}
+.card h2{font-size:13px;text-transform:uppercase;letter-spacing:.6px;color:var(--muted);
+margin:0 0 10px}
+textarea{width:100%;min-height:150px;resize:vertical;padding:10px;border-radius:8px;
+border:1px solid var(--line);background:var(--bg);color:var(--ink);font:inherit}
+select,input[type=text],input[type=number]{width:100%;padding:8px;border-radius:8px;
+border:1px solid var(--line);background:var(--bg);color:var(--ink);font:inherit}
+label{display:block;font-size:12px;color:var(--muted);margin:10px 0 4px}
+.row{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px}
+button{font:inherit;padding:8px 14px;border-radius:8px;border:1px solid var(--line);
+background:var(--panel);color:var(--ink);cursor:pointer}
+button:hover{border-color:var(--accent)}
+button.primary{background:var(--accent);color:var(--accent-ink);border-color:var(--accent)}
+button.link{border:0;background:none;color:var(--muted);padding:2px 6px}
+button.link:hover{color:var(--accent)}
+button[disabled]{opacity:.55;cursor:not-allowed}
+.actions{display:flex;gap:8px;align-items:center;margin-top:12px;flex-wrap:wrap}
+.status{color:var(--muted);font-size:13px}
+ul{list-style:none;margin:0;padding:0}
+li.session{display:flex;align-items:center;gap:6px;padding:7px 8px;border-radius:8px;cursor:pointer}
+li.session:hover{background:var(--bg)}
+li.session.on{background:var(--bg);box-shadow:inset 2px 0 0 var(--accent)}
+li.session .nm{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+li.session .ct{color:var(--muted);font-size:12px}
+.item{border:1px solid var(--line);border-radius:8px;padding:10px;margin-bottom:8px}
+.item .txt{font-size:14px;margin-bottom:6px}
+.item .meta{color:var(--muted);font-size:12px;display:flex;gap:10px;flex-wrap:wrap}
+audio{width:100%;margin-top:8px}
+pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:10px;
+overflow:auto;max-height:340px;font-size:12px;margin:0}
+.tabs{display:flex;gap:6px;margin-bottom:12px}
+.tabs button.on{background:var(--accent);color:var(--accent-ink);border-color:var(--accent)}
+.hide{display:none}
+.err{color:var(--danger)}
+</style>
+</head>
+<body>
+<header>
+  <h1>ZenTTS Studio</h1>
+  <span class="by" id="ver"></span>
+  <span class="spacer"></span>
+  <span class="by"><a href="/api" style="color:inherit">API</a></span>
+</header>
+
+<div class="layout">
+  <aside class="card">
+    <h2>Sessions</h2>
+    <ul id="sessions"></ul>
+    <div class="actions"><button id="newSession">New session</button></div>
+  </aside>
+
+  <main>
+    <div class="tabs">
+      <button id="tabStudio" class="on">Studio</button>
+      <button id="tabHistory">History</button>
+      <button id="tabLogs">Logs</button>
+    </div>
+
+    <section id="studio" class="card">
+      <h2>Text</h2>
+      <textarea id="text" placeholder="Paste any amount of text. Long text is split, spoken in order and joined into one file."></textarea>
+      <div class="row">
+        <div><label for="voice">Voice</label><select id="voice"></select></div>
+        <div><label for="lang">Language</label><select id="lang">
+          <option value="en-us">en-us</option><option value="en-gb">en-gb</option></select></div>
+        <div><label for="format">Format</label><select id="format"></select></div>
+        <div><label for="speed">Speed</label>
+          <input id="speed" type="number" min="0.5" max="2" step="0.1" value="1"></div>
+      </div>
+      <div class="actions">
+        <button id="go" class="primary">Generate</button>
+        <button id="stream">Stream</button>
+        <a id="dl" class="hide"><button>Download</button></a>
+        <span class="status" id="status"></span>
+      </div>
+      <audio id="player" controls class="hide"></audio>
+    </section>
+
+    <section id="history" class="card hide">
+      <h2>History <span class="status" id="histName"></span></h2>
+      <div id="items"></div>
+    </section>
+
+    <section id="logs" class="card hide">
+      <h2>Requests</h2>
+      <div class="actions" style="margin:0 0 10px">
+        <button id="refreshLogs">Refresh</button>
+      </div>
+      <pre id="logbox"></pre>
+    </section>
+  </main>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let sessionId = localStorage.getItem('zentts_session') || null;
+let lastBlob = null;
+
+const api = async (path, options) => {
+  const response = await fetch(path, options);
+  if (!response.ok) {
+    let detail = response.statusText;
+    try { detail = (await response.json()).error.message; } catch (e) {}
+    throw new Error(detail);
+  }
+  return response.json();
+};
+
+async function boot() {
+  const index = await api('/api');
+  $('ver').textContent = 'v' + index.version + ' - by ' + index.author;
+  const voices = await api('/v1/voices');
+  const groups = {};
+  voices.data.forEach(v => { (groups[v.description] ||= []).push(v); });
+  $('voice').innerHTML = Object.entries(groups).map(([label, list]) =>
+    `<optgroup label="${label}">` + list.map(v =>
+      `<option value="${v.id}"${v.id === voices.default ? ' selected' : ''}>${v.id}</option>`
+    ).join('') + '</optgroup>').join('');
+  $('format').innerHTML = index.speech_request.response_format
+    .map(f => `<option${f === 'mp3' ? ' selected' : ''}>${f}</option>`).join('');
+  await loadSessions();
+}
+
+async function loadSessions() {
+  const data = await api('/v1/sessions');
+  if (!data.data.length) { await api('/v1/sessions', {method: 'POST'}); return loadSessions(); }
+  if (!data.data.some(s => s.id === sessionId)) sessionId = data.data[0].id;
+  localStorage.setItem('zentts_session', sessionId);
+  $('sessions').innerHTML = data.data.map(s => `
+    <li class="session ${s.id === sessionId ? 'on' : ''}" data-id="${s.id}">
+      <span class="nm">${escapeHtml(s.name)}</span>
+      <span class="ct">${s.items}</span>
+      <button class="link" data-act="rename" title="Rename">rename</button>
+      <button class="link" data-act="delete" title="Delete">del</button>
+    </li>`).join('');
+  $('sessions').querySelectorAll('li').forEach(li => {
+    li.onclick = async event => {
+      const id = li.dataset.id, act = event.target.dataset.act;
+      if (act === 'rename') {
+        const name = prompt('New name', li.querySelector('.nm').textContent);
+        if (name) await api('/v1/sessions/' + id, {method: 'PATCH',
+          headers: {'Content-Type': 'application/json'}, body: JSON.stringify({name})});
+      } else if (act === 'delete') {
+        if (!confirm('Delete this session and its audio?')) return;
+        await api('/v1/sessions/' + id, {method: 'DELETE'});
+        if (id === sessionId) sessionId = null;
+      } else {
+        sessionId = id;
+      }
+      localStorage.setItem('zentts_session', sessionId || '');
+      await loadSessions();
+      if (!$('history').classList.contains('hide')) loadHistory();
+    };
+  });
+}
+
+function escapeHtml(text) {
+  return String(text).replace(/[&<>"]/g, c =>
+    ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'}[c]));
+}
+
+function body() {
+  return {
+    input: $('text').value,
+    voice: $('voice').value,
+    language: $('lang').value,
+    response_format: $('format').value,
+    speed: parseFloat($('speed').value) || 1,
+    session_id: sessionId
+  };
+}
+
+async function generate(stream) {
+  const payload = body();
+  if (!payload.input.trim()) { $('status').textContent = 'Enter some text first.'; return; }
+  if (stream) { payload.stream = true; payload.response_format = 'mp3'; }
+
+  $('go').disabled = $('stream').disabled = true;
+  $('status').textContent = stream ? 'Streaming...' : 'Generating...';
+  const started = Date.now();
+
+  try {
+    const response = await fetch('/v1/audio/speech', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload)
+    });
+    if (!response.ok) throw new Error((await response.json()).error.message);
+
+    lastBlob = await response.blob();
+    const url = URL.createObjectURL(lastBlob);
+    $('player').src = url;
+    $('player').classList.remove('hide');
+    $('player').play().catch(() => {});
+    const link = $('dl');
+    link.href = url;
+    link.download = 'zentts.' + payload.response_format;
+    link.classList.remove('hide');
+    $('status').textContent =
+      `${(lastBlob.size / 1024).toFixed(0)} kB in ${((Date.now() - started) / 1000).toFixed(1)}s`;
+    await loadSessions();
+    if (!$('history').classList.contains('hide')) loadHistory();
+  } catch (e) {
+    $('status').innerHTML = '<span class="err">' + escapeHtml(e.message) + '</span>';
+  } finally {
+    $('go').disabled = $('stream').disabled = false;
+  }
+}
+
+async function loadHistory() {
+  if (!sessionId) return;
+  const session = await api('/v1/sessions/' + sessionId);
+  $('histName').textContent = session.name;
+  $('items').innerHTML = session.items.length ? session.items.slice().reverse().map(i => `
+    <div class="item">
+      <div class="txt">${escapeHtml(i.text.slice(0, 240))}${i.text.length > 240 ? '...' : ''}</div>
+      <div class="meta">
+        <span>${i.voice}</span><span>${i.language}</span><span>x${i.speed}</span>
+        <span>${i.format}</span><span>${(i.bytes / 1024).toFixed(0)} kB</span>
+        <span>${new Date(i.created * 1000).toLocaleString()}</span>
+      </div>
+      <audio controls preload="none" src="/v1/sessions/${sessionId}/items/${i.id}/audio"></audio>
+      <div class="actions">
+        <a href="/v1/sessions/${sessionId}/items/${i.id}/audio?download=1"><button>Download</button></a>
+      </div>
+    </div>`).join('') : '<p class="status">Nothing generated in this session yet.</p>';
+}
+
+async function loadLogs() {
+  const data = await api('/v1/logs');
+  $('logbox').textContent = data.data.map(l =>
+    `${new Date(l.time * 1000).toLocaleTimeString()}  ${String(l.status).padEnd(4)} ` +
+    `${l.method.padEnd(6)} ${l.path}  ${l.ms}ms${l.detail ? '  ' + l.detail : ''}`
+  ).join('\\n') || 'No requests yet.';
+}
+
+function tab(name) {
+  ['studio', 'history', 'logs'].forEach(section => {
+    $(section).classList.toggle('hide', section !== name);
+    $('tab' + section[0].toUpperCase() + section.slice(1)).classList.toggle('on', section === name);
+  });
+  if (name === 'history') loadHistory();
+  if (name === 'logs') loadLogs();
+}
+
+$('go').onclick = () => generate(false);
+$('stream').onclick = () => generate(true);
+$('newSession').onclick = async () => {
+  const session = await api('/v1/sessions', {method: 'POST',
+    headers: {'Content-Type': 'application/json'}, body: JSON.stringify({})});
+  sessionId = session.id;
+  localStorage.setItem('zentts_session', sessionId);
+  await loadSessions();
+};
+$('tabStudio').onclick = () => tab('studio');
+$('tabHistory').onclick = () => tab('history');
+$('tabLogs').onclick = () => tab('logs');
+$('refreshLogs').onclick = loadLogs;
+
+boot().catch(e => { $('status').innerHTML = '<span class="err">' + e.message + '</span>'; });
+</script>
+</body>
+</html>
+"""
+
+
+##############################################################################
+# Request handler
+##############################################################################
+
+
 class ZenTTSHandler(BaseHTTPRequestHandler):
-    """Serves the OpenAI-compatible endpoints."""
+    """Serves the web interface and the OpenAI-compatible endpoints."""
 
     server_version = f"ZenTTS/{__version__}"
     protocol_version = "HTTP/1.1"
@@ -2313,12 +2935,26 @@ class ZenTTSHandler(BaseHTTPRequestHandler):
     allow_cors = True
     quiet = False
 
+    # -- plumbing ---------------------------------------------------------
+
     def log_message(self, format, *args):
         if not self.quiet:
             message = format % args
             sys.stderr.write(
                 f"{self.log_date_time_string()} {self.address_string()} {message}\n"
             )
+
+    def _record(self, status, detail=""):
+        REQUEST_LOG.append(
+            {
+                "time": time.time(),
+                "method": self.command,
+                "path": self.path,
+                "status": status,
+                "ms": int((time.time() - getattr(self, "_started", time.time())) * 1000),
+                "detail": detail,
+            }
+        )
 
     def _send(self, status, body=b"", content_type="application/json", extra=None):
         if isinstance(body, str):
@@ -2331,12 +2967,15 @@ class ZenTTSHandler(BaseHTTPRequestHandler):
             self.send_header(
                 "Access-Control-Allow-Headers", "Authorization, Content-Type"
             )
-            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header(
+                "Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS"
+            )
         for key, value in (extra or {}).items():
             self.send_header(key, value)
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(body)
+        self._record(status)
 
     def _send_json(self, status, payload, extra=None):
         self._send(status, json.dumps(payload, indent=2), "application/json", extra)
@@ -2344,10 +2983,8 @@ class ZenTTSHandler(BaseHTTPRequestHandler):
     def _drain_body(self):
         """Discard an unread request body, so keep-alive stays in sync.
 
-        Without this, replying before reading the body leaves those bytes in
-        the socket, and the next request on the connection is parsed from the
-        middle of the old one. Draining a body that was already read would
-        block until the client gives up, so this is a no-op in that case.
+        Draining a body that was already read would block until the client
+        gives up, so this is a no-op in that case.
         """
         if getattr(self, "_body_read", False):
             return
@@ -2365,29 +3002,74 @@ class ZenTTSHandler(BaseHTTPRequestHandler):
     def _send_error(self, status, message, kind="invalid_request_error"):
         # Shaped like an OpenAI error, so existing clients can read it.
         self._drain_body()
-        self._send_json(status, {"error": {"message": message, "type": kind}})
+        self._send(
+            status,
+            json.dumps({"error": {"message": message, "type": kind}}, indent=2),
+            "application/json",
+        )
+        REQUEST_LOG[-1]["detail"] = message[:120]
 
     def _authorized(self):
         if not self.api_key:
             return True
         header = self.headers.get("Authorization", "")
-        return header.startswith("Bearer ") and header[7:].strip() == self.api_key
+        if header.startswith("Bearer ") and header[7:].strip() == self.api_key:
+            return True
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        return query.get("api_key", [None])[0] == self.api_key
+
+    def _read_json(self):
+        """Read a JSON body, or raise ValueError with a reason."""
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            raise ValueError("Invalid Content-Length")
+
+        if length > MAX_REQUEST_BYTES:
+            self.close_connection = True
+            raise ValueError(f"Request body is larger than {MAX_REQUEST_BYTES} bytes")
+
+        if length <= 0:
+            self._body_read = True
+            return {}
+
+        raw = self.rfile.read(length)
+        self._body_read = True
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as e:
+            raise ValueError(f"Body must be JSON: {e}")
+        if not isinstance(payload, dict):
+            raise ValueError("Body must be a JSON object")
+        return payload
+
+    # -- routing ----------------------------------------------------------
 
     def do_OPTIONS(self):
+        self._started = time.time()
         self._send(204)
 
     def do_HEAD(self):
         self.do_GET()
 
     def do_GET(self):
-        path = urllib.parse.urlparse(self.path).path.rstrip("/") or "/"
+        self._started = time.time()
+        self._body_read = True
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path.rstrip("/") or "/"
+        parts = [p for p in path.split("/") if p]
 
         if path == "/":
-            self._send_json(200, self._index())
-        elif path in ("/health", "/healthz"):
-            self._send_json(200, {"status": "ok", "version": __version__})
-        elif path in ("/v1/models", "/models"):
-            self._send_json(
+            return self._send(200, WEB_UI, "text/html; charset=utf-8")
+
+        if path in ("/api", "/v1"):
+            return self._send_json(200, self._index())
+
+        if path in ("/health", "/healthz"):
+            return self._send_json(200, {"status": "ok", "version": __version__})
+
+        if path in ("/v1/models", "/models"):
+            return self._send_json(
                 200,
                 {
                     "object": "list",
@@ -2397,52 +3079,143 @@ class ZenTTSHandler(BaseHTTPRequestHandler):
                     ],
                 },
             )
-        elif path in ("/v1/voices", "/voices"):
+
+        if path in ("/v1/voices", "/voices"):
+            return self._send_json(200, self._voices())
+
+        if path == "/v1/license":
+            allowed, message = check_license()
+            return self._send_json(
+                200, {"enabled": allowed, "message": message, "version": __version__}
+            )
+
+        if path == "/v1/logs":
             if not self._authorized():
                 return self._send_error(401, "Invalid API key", "authentication_error")
-            self._send_json(200, self._voices())
-        else:
-            self._send_error(404, f"Unknown endpoint: {path}", "not_found_error")
+            return self._send_json(200, {"object": "list", "data": list(REQUEST_LOG)})
+
+        if path == "/v1/sessions":
+            if not self._authorized():
+                return self._send_error(401, "Invalid API key", "authentication_error")
+            return self._send_json(200, {"object": "list", "data": list_sessions()})
+
+        # /v1/sessions/<id>
+        if len(parts) == 3 and parts[:2] == ["v1", "sessions"]:
+            if not self._authorized():
+                return self._send_error(401, "Invalid API key", "authentication_error")
+            session = load_session(parts[2])
+            if not session:
+                return self._send_error(404, f"No such session: {parts[2]}", "not_found_error")
+            return self._send_json(200, session)
+
+        # /v1/sessions/<id>/items/<item>/audio
+        if (
+            len(parts) == 6
+            and parts[:2] == ["v1", "sessions"]
+            and parts[3] == "items"
+            and parts[5] == "audio"
+        ):
+            if not self._authorized():
+                return self._send_error(401, "Invalid API key", "authentication_error")
+            return self._send_item_audio(parts[2], parts[4], parsed.query)
+
+        self._send_error(404, f"Unknown endpoint: {path}", "not_found_error")
 
     def do_POST(self):
+        self._started = time.time()
         self._body_read = False
         path = urllib.parse.urlparse(self.path).path.rstrip("/") or "/"
-        if path not in ("/v1/audio/speech", "/audio/speech"):
-            return self._send_error(404, f"Unknown endpoint: {path}", "not_found_error")
 
+        if path in ("/v1/audio/speech", "/audio/speech"):
+            return self._speech()
+
+        if path == "/v1/sessions":
+            if not self._authorized():
+                return self._send_error(401, "Invalid API key", "authentication_error")
+            try:
+                payload = self._read_json()
+            except ValueError as e:
+                return self._send_error(400, str(e))
+            return self._send_json(201, new_session(payload.get("name")))
+
+        self._send_error(404, f"Unknown endpoint: {path}", "not_found_error")
+
+    def do_PATCH(self):
+        self._started = time.time()
+        self._body_read = False
+        parts = [p for p in urllib.parse.urlparse(self.path).path.split("/") if p]
+
+        if len(parts) == 3 and parts[:2] == ["v1", "sessions"]:
+            if not self._authorized():
+                return self._send_error(401, "Invalid API key", "authentication_error")
+            try:
+                payload = self._read_json()
+                session = rename_session(parts[2], payload.get("name", ""))
+            except ValueError as e:
+                return self._send_error(400, str(e))
+            if not session:
+                return self._send_error(404, f"No such session: {parts[2]}", "not_found_error")
+            return self._send_json(200, session)
+
+        self._send_error(404, "Unknown endpoint", "not_found_error")
+
+    def do_DELETE(self):
+        self._started = time.time()
+        self._body_read = True
+        parts = [p for p in urllib.parse.urlparse(self.path).path.split("/") if p]
+
+        if len(parts) == 3 and parts[:2] == ["v1", "sessions"]:
+            if not self._authorized():
+                return self._send_error(401, "Invalid API key", "authentication_error")
+            try:
+                deleted = delete_session(parts[2])
+            except ValueError as e:
+                return self._send_error(400, str(e))
+            if not deleted:
+                return self._send_error(404, f"No such session: {parts[2]}", "not_found_error")
+            return self._send_json(200, {"id": parts[2], "deleted": True})
+
+        self._send_error(404, "Unknown endpoint", "not_found_error")
+
+    # -- endpoints --------------------------------------------------------
+
+    def _send_item_audio(self, session_id, item_id, query):
+        try:
+            path, item = session_item_path(session_id, item_id)
+        except ValueError as e:
+            return self._send_error(400, str(e))
+
+        if not path or not path.exists():
+            return self._send_error(404, "No such history item", "not_found_error")
+
+        _, _, content_type = SERVER_FORMATS.get(item["format"], (None, None, "audio/mpeg"))
+        extra = {}
+        if urllib.parse.parse_qs(query).get("download"):
+            extra["Content-Disposition"] = f'attachment; filename="{path.name}"'
+        with open(path, "rb") as fh:
+            self._send(200, fh.read(), content_type, extra)
+
+    def _speech(self):
         if not self._authorized():
             return self._send_error(401, "Invalid API key", "authentication_error")
 
         try:
-            length = int(self.headers.get("Content-Length") or 0)
-        except ValueError:
-            return self._send_error(400, "Invalid Content-Length")
-
-        if length <= 0:
-            return self._send_error(400, "Request body is empty")
-
-        if length > MAX_REQUEST_BYTES:
-            self.close_connection = True
-            return self._send_error(
-                413, f"Request body is larger than {MAX_REQUEST_BYTES} bytes"
-            )
-
-        raw = self.rfile.read(length)
-        self._body_read = True
-
-        try:
-            payload = json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as e:
-            return self._send_error(400, f"Body must be JSON: {e}")
-
-        if not isinstance(payload, dict):
-            return self._send_error(400, "Body must be a JSON object")
+            payload = self._read_json()
+        except ValueError as e:
+            return self._send_error(400, str(e))
 
         text = payload.get("input") or payload.get("text") or ""
         if not str(text).strip():
             return self._send_error(400, "Field 'input' is required")
 
         response_format = str(payload.get("response_format", "mp3")).lower()
+        if response_format not in SERVER_FORMATS:
+            return self._send_error(
+                400,
+                f"Unsupported response_format: {response_format}. "
+                f"Supported: {', '.join(sorted(SERVER_FORMATS))}",
+            )
+
         lang = str(payload.get("language") or payload.get("lang") or self.default_lang)
         if lang not in SUPPORTED_LANGUAGES:
             return self._send_error(
@@ -2460,9 +3233,14 @@ class ZenTTSHandler(BaseHTTPRequestHandler):
         clamped = min(max(speed, 0.5), 2.0)
 
         try:
-            voice = resolve_api_voice(
-                payload.get("voice") or self.default_voice, self.engine
-            )
+            voice = resolve_api_voice(payload.get("voice") or self.default_voice, self.engine)
+        except ValueError as e:
+            return self._send_error(400, str(e))
+
+        if payload.get("stream") and response_format in STREAMABLE_FORMATS:
+            return self._stream_speech(str(text), voice, clamped, lang, response_format)
+
+        try:
             samples, rate = synthesize(self.engine, str(text), voice, clamped, lang)
             audio, content_type = encode_audio(samples, rate, response_format)
         except ValueError as e:
@@ -2474,7 +3252,72 @@ class ZenTTSHandler(BaseHTTPRequestHandler):
         headers = {"X-ZenTTS-Sample-Rate": str(rate)}
         if clamped != speed:
             headers["X-ZenTTS-Speed-Clamped"] = f"{speed} -> {clamped}"
+
+        item = self._store(payload, audio, text, voice, response_format, clamped, lang,
+                           len(samples) / rate if rate else 0)
+        if item:
+            headers["X-ZenTTS-Item"] = item["id"]
+
         self._send(200, audio, content_type, headers)
+
+    def _stream_speech(self, text, voice, speed, lang, response_format):
+        """Send audio in chunks as it is generated, using chunked encoding."""
+        _, _, content_type = SERVER_FORMATS[response_format]
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Transfer-Encoding", "chunked")
+        self.send_header("X-ZenTTS-Sample-Rate", str(SAMPLE_RATE))
+        if self.allow_cors:
+            self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+
+        collected = []
+        try:
+            for piece in chunk_text(text, initial_chunk_size=600) or [text]:
+                samples, rate = self.engine.create(
+                    piece, voice=voice, speed=speed, lang=lang
+                )
+                if not len(samples):
+                    continue
+                collected.append(samples)
+                audio, _ = encode_audio(samples, rate, response_format)
+                self.wfile.write(f"{len(audio):X}\r\n".encode())
+                self.wfile.write(audio)
+                self.wfile.write(b"\r\n")
+                self.wfile.flush()
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            self.close_connection = True
+            return self._record(499, "client went away mid-stream")
+        except Exception as e:
+            log.exception("Streaming failed")
+            self.close_connection = True
+            return self._record(500, f"stream failed: {e}")
+
+        self._record(200, "streamed")
+
+    def _store(self, payload, audio, text, voice, response_format, speed, lang, seconds):
+        """Add the clip to a session, when the request names one."""
+        session_id = payload.get("session_id")
+        if not session_id:
+            return None
+        try:
+            return add_session_item(
+                session_id,
+                audio,
+                {
+                    "text": str(text),
+                    "voice": voice if isinstance(voice, str) else "blend",
+                    "format": response_format,
+                    "speed": speed,
+                    "language": lang,
+                    "seconds": round(seconds, 2),
+                },
+            )
+        except (ValueError, OSError) as e:
+            log.debug(f"Could not store history: {e}")
+            return None
 
     def _voices(self):
         return {
@@ -2502,18 +3345,29 @@ class ZenTTSHandler(BaseHTTPRequestHandler):
             "url": __url__,
             "openai_compatible": True,
             "endpoints": {
-                "GET /": "this list of endpoints",
+                "GET /": "web interface",
+                "GET /api": "this list of endpoints",
                 "GET /health": "liveness check",
                 "GET /v1/models": "models this server answers to",
-                "GET /v1/voices": "ZenTTS voices and their OpenAI aliases",
+                "GET /v1/voices": "voices and their OpenAI aliases",
+                "GET /v1/license": "licence status of this install",
+                "GET /v1/logs": "recent requests",
+                "GET /v1/sessions": "list sessions",
+                "POST /v1/sessions": "create a session",
+                "GET /v1/sessions/{id}": "session with its history",
+                "PATCH /v1/sessions/{id}": "rename a session",
+                "DELETE /v1/sessions/{id}": "delete a session and its audio",
+                "GET /v1/sessions/{id}/items/{item}/audio": "download a clip",
                 "POST /v1/audio/speech": "generate speech (OpenAI compatible)",
             },
             "speech_request": {
-                "input": "the text to speak (required)",
+                "input": "the text to speak, any length (required)",
                 "voice": f"ZenTTS id, OpenAI name, or a blend (default {self.default_voice})",
                 "response_format": sorted(SERVER_FORMATS),
                 "speed": "0.5 to 2.0, values outside are clamped",
                 "language": list(SUPPORTED_LANGUAGES),
+                "stream": f"true to stream {', '.join(sorted(STREAMABLE_FORMATS))} as it is made",
+                "session_id": "store the result in this session's history",
                 "model": "accepted and ignored, any id works",
             },
             "authentication": "Bearer token required" if self.api_key else "none",
@@ -2531,7 +3385,8 @@ def run_server(
     cors=True,
     quiet=False,
 ):
-    """Start the OpenAI-compatible HTTP server."""
+    """Start the web interface and the OpenAI-compatible API."""
+    require_license()
     engine = load_engine(model_path, voices_path)
 
     if default_voice not in engine.get_voices():
@@ -2563,21 +3418,28 @@ def run_server(
     reachable = "127.0.0.1" if host in ("0.0.0.0", "") else host
     base = f"http://{reachable}:{port}"
 
-    print(f"\nZenTTS {__version__} - OpenAI-compatible speech API")
-    print(f"Listening on {base}\n")
+    print(f"\nZenTTS {__version__} - speech studio and OpenAI-compatible API")
+    print(f"Open {base} in a browser\n")
     print("Endpoints:")
-    print(f"  GET  {base}/                  this list of endpoints")
-    print(f"  GET  {base}/health            liveness check")
-    print(f"  GET  {base}/v1/models         models this server answers to")
-    print(f"  GET  {base}/v1/voices         voices and OpenAI aliases")
-    print(f"  POST {base}/v1/audio/speech   generate speech")
-    print(f"\nVoices:  {len(engine.get_voices())} English, default {default_voice}")
-    print(f"Formats: {', '.join(sorted(SERVER_FORMATS))}")
-    print(f"Auth:    {'Bearer token required' if api_key else 'none (local use)'}")
-    print("\nQuick test:")
-    print(f"  curl {base}/v1/audio/speech -H 'Content-Type: application/json' \\")
-    print('    -d \'{"input": "Hello from ZenTTS.", "voice": "' + default_voice + '"}\' \\')
-    print("    --output hello.mp3")
+    print(f"  GET    {base}/                                    web interface")
+    print(f"  GET    {base}/api                                 endpoint list")
+    print(f"  GET    {base}/health                              liveness check")
+    print(f"  GET    {base}/v1/models                           models")
+    print(f"  GET    {base}/v1/voices                           voices")
+    print(f"  GET    {base}/v1/license                          licence status")
+    print(f"  GET    {base}/v1/logs                             recent requests")
+    print(f"  GET    {base}/v1/sessions                         list sessions")
+    print(f"  POST   {base}/v1/sessions                         create a session")
+    print(f"  GET    {base}/v1/sessions/<id>                    session history")
+    print(f"  PATCH  {base}/v1/sessions/<id>                    rename a session")
+    print(f"  DELETE {base}/v1/sessions/<id>                    delete a session")
+    print(f"  GET    {base}/v1/sessions/<id>/items/<item>/audio  download a clip")
+    print(f"  POST   {base}/v1/audio/speech                     generate speech")
+    print(f"\nVoices:   {len(engine.get_voices())} English, default {default_voice}")
+    print(f"Formats:  {', '.join(sorted(SERVER_FORMATS))}")
+    print(f"Stream:   {', '.join(sorted(STREAMABLE_FORMATS))}")
+    print(f"History:  {sessions_dir()}")
+    print(f"Auth:     {'Bearer token required' if api_key else 'none (local use)'}")
     print("\nPress Ctrl+C to stop.\n")
     sys.stdout.flush()
 
@@ -2741,6 +3603,14 @@ def main():
     elif "--help" in sys.argv or "-h" in sys.argv:
         print_usage()
         sys.exit(0)
+    elif "--license" in sys.argv or (len(sys.argv) > 1 and sys.argv[1] == "license"):
+        allowed, message = check_license(force=True, quiet=False)
+        print(f"\nZenTTS {__version__}")
+        print(f"Status:  {'active' if allowed else 'disabled'}")
+        print(f"Reason:  {message}")
+        print(f"Control: {os.getenv('ZENTTS_LICENSE_URL', LICENSE_CONTROL_URL)}")
+        print(f"State:   {license_state_path()}\n")
+        sys.exit(0 if allowed else 2)
     elif "--download" in sys.argv:
         try:
             model, voices = ensure_models()
