@@ -684,7 +684,7 @@ class PdfParser:
 
     def _clean_title(self, title: str) -> str:
         """Clean up chapter title text."""
-        return title.strip().replace("​", " ")
+        return title.strip().replace("\u200b", " ")
 
     def _clean_markdown(self, text: str) -> str:
         """Clean up converted markdown text."""
@@ -1145,8 +1145,6 @@ signal.signal(signal.SIGINT, handle_ctrl_c)
 
 def merge_chunks_to_chapters(split_output_dir, format="wav"):
     """Merge audio chunks into complete chapter files."""
-    global stop_spinner
-
     if not os.path.exists(split_output_dir):
         print(f"Error: Directory {split_output_dir} does not exist.")
         return
