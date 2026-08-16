@@ -295,7 +295,7 @@ sf.write("hello.wav", samples, sample_rate)
 
 ## Requirements
 
-Python 3.11 or 3.12. Everything else is installed by pip. `--format mp3` needs
+Python 3.11 or later. Everything else is installed by pip. `--format mp3` needs
 `libsndfile` with MP3 support, which ships with the `soundfile` wheels on
 Windows, macOS and Linux.
 
