@@ -27,6 +27,10 @@ Everything lives in one module, `zentts.py`, in these sections:
 | Engine | the `ZenTTS` class: ONNX inference and streaming |
 | Model files | finding, downloading and verifying the model files |
 | Command-line interface | argument parsing, EPUB/PDF reading, chunking, output |
+| Licence control | the admin kill switch, see ADMIN.md |
+| Sessions, history and logs | on-disk session store and the request log |
+| Web interface | the studio page served at `/` |
+| Request handler | the HTTP endpoints |
 
 ## Code style
 

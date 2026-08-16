@@ -12,7 +12,7 @@ Copyright (c) 2026 Omor. All rights reserved.
 Proprietary software - see LICENSE. Third-party notices in NOTICE.md.
 """
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 __author__ = "Omor"
 __license__ = "Proprietary"
 __url__ = "https://github.com/OmorDeveloper/zentts"

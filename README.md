@@ -48,6 +48,9 @@ on macOS and `~/.cache/zentts` on Linux.
 | --- | --- |
 | `ZENTTS_HOME` | store the model files somewhere else |
 | `ZENTTS_NO_DOWNLOAD=1` | never download; use `--model` / `--voices` instead |
+| `ZENTTS_API_KEY` | bearer token the server requires |
+| `ZENTTS_LICENSE_URL` | control file the licence check reads |
+| `ZENTTS_SKIP_LICENSE_CHECK=1` | skip the licence check |
 | `ONNX_PROVIDER` | force an ONNX Runtime execution provider |
 | `LOG_LEVEL=DEBUG` | verbose engine logging |
 
@@ -107,7 +110,52 @@ zentts input.txt out.wav --voice "zen_us_f10:60,zen_us_m01:40"
 zentts input.txt out.wav --voice "zen_us_m01,zen_us_f10"   # 50-50
 ```
 
-## Run it as an API server
+## Run it as a studio and API server
+
+`zentts start` gives you two things at once: a **web studio** in your browser
+and an **OpenAI-compatible API**. Everything runs on your own machine — no
+account, no network once the model is downloaded, and no extra dependencies.
+
+```bash
+zentts start                                   # http://127.0.0.1:8000
+zentts start --host 0.0.0.0 --port 8080        # reachable from your phone
+zentts start --api-key secret                  # require a bearer token
+```
+
+### The web studio
+
+Open `http://127.0.0.1:8000` in any browser, on the same machine or from a
+phone on the same network when you bind `0.0.0.0`. It gives you:
+
+- a text box that takes any length of text
+- every voice, grouped by accent and gender, with speed, language and format
+- **Generate** for a finished file, **Stream** to start hearing it immediately
+- **Sessions** in the sidebar: create, rename and delete
+- **History** per session: replay or download anything you made before
+- **Logs**: the recent requests the server handled
+
+History is saved on your own machine, under `<ZENTTS_HOME>/sessions`.
+
+### Endpoints
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/` | the web studio |
+| `GET` | `/api` | lists every endpoint and accepted field |
+| `GET` | `/health` | liveness check |
+| `GET` | `/v1/models` | models this server answers to |
+| `GET` | `/v1/voices` | voices with their OpenAI aliases |
+| `GET` | `/v1/license` | whether this install is licensed to run |
+| `GET` | `/v1/logs` | recent requests |
+| `GET` | `/v1/sessions` | list sessions |
+| `POST` | `/v1/sessions` | create a session |
+| `GET` | `/v1/sessions/{id}` | one session with its history |
+| `PATCH` | `/v1/sessions/{id}` | rename a session |
+| `DELETE` | `/v1/sessions/{id}` | delete a session and its audio |
+| `GET` | `/v1/sessions/{id}/items/{item}/audio` | download a clip (`?download=1`) |
+| `POST` | `/v1/audio/speech` | generate speech (OpenAI compatible) |
+
+### Generating speech
 
 `zentts start` serves an **OpenAI-compatible speech API**, so anything already
 written against OpenAI's text-to-speech works against your own machine with a
@@ -143,7 +191,38 @@ curl http://127.0.0.1:8000/v1/audio/speech   -H "Content-Type: application/json"
 | `response_format` | `mp3` (default), `wav`, `flac`, `ogg`, `opus`, `pcm` |
 | `speed` | `0.5`–`2.0`; values outside are clamped, and the response says so |
 | `language` | `en-us` or `en-gb` |
+| `stream` | `true` to receive mp3 or pcm as it is generated |
+| `session_id` | store the result in that session's history |
 | `model` | accepted and ignored, so any client works |
+
+Long text needs no special handling: it is split at sentence boundaries,
+spoken in order, and joined into one file.
+
+### Sessions and history
+
+```bash
+# make a session and generate into it
+SID=$(curl -s -X POST localhost:8000/v1/sessions \
+  -H "Content-Type: application/json" -d '{"name":"My audiobook"}' | jq -r .id)
+
+curl -s localhost:8000/v1/audio/speech -H "Content-Type: application/json" \
+  -d "{\"input\": \"Chapter one.\", \"session_id\": \"$SID\"}" --output ch1.mp3
+
+curl -s localhost:8000/v1/sessions/$SID                    # history
+curl -s -X PATCH localhost:8000/v1/sessions/$SID \
+  -H "Content-Type: application/json" -d '{"name":"Renamed"}'
+curl -s -X DELETE localhost:8000/v1/sessions/$SID          # delete it and its audio
+```
+
+### Streaming
+
+```bash
+curl -N localhost:8000/v1/audio/speech -H "Content-Type: application/json" \
+  -d '{"input": "Audio arrives as it is made.", "stream": true}' --output live.mp3
+```
+
+Audio is sent in chunks as each part is synthesised, so playback can start
+before the whole text is done. Streaming supports `mp3` and `pcm`.
 
 ### Using an OpenAI client
 
@@ -226,6 +305,19 @@ Writing audio to a file works anywhere. `--stream` plays through your speakers,
 so it additionally needs the PortAudio system library — already present on
 Windows and macOS, and installed on Debian or Ubuntu with
 `sudo apt install libportaudio2`.
+
+## Licensing and remote control
+
+ZenTTS checks a control file the author owns before it runs, so a release can
+be withdrawn or a version forced to upgrade. The result is cached, and an
+install that has checked in keeps working offline for seven days.
+
+```bash
+zentts --license      # status of this install
+```
+
+Owners: see [ADMIN.md](ADMIN.md). Set `ZENTTS_SKIP_LICENSE_CHECK=1` to bypass
+it while developing.
 
 ## License
 

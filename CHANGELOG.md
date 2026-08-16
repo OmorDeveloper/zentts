@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.3.0
+
+- **Web studio.** `zentts start` now serves a browser interface at `/`: text
+  box, every voice, speed, language, format, generate or stream, plus session
+  and history management and a request log view.
+- **Sessions and history, saved on your machine.** Create, rename and delete
+  sessions; every clip is stored under `<ZENTTS_HOME>/sessions` with its text,
+  voice and settings, and can be replayed or downloaded later.
+  - `GET/POST /v1/sessions`, `GET/PATCH/DELETE /v1/sessions/{id}`
+  - `GET /v1/sessions/{id}/items/{item}/audio` to download a clip
+  - `session_id` on a speech request files the result in that session
+- **Streaming.** `"stream": true` sends mp3 or pcm in chunks as it is made, so
+  playback starts before the whole text is finished.
+- **Request log endpoint**, `GET /v1/logs`, also shown in the studio.
+- **Admin kill switch.** Every install checks a control file the author owns
+  and stops when it is disabled, when its version is blocked, or when the
+  package is unpublished. Cached for 12 hours, with 7 days of offline grace.
+  `zentts --license` and `GET /v1/license` report the state. See ADMIN.md.
+- Long text works end to end over the API: split, spoken in order, joined into
+  one file.
+
 ## 1.2.0
 
 - **`zentts start` runs an OpenAI-compatible speech API server.** Point any
