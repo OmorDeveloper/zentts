@@ -22,11 +22,7 @@
 
 ## 1.3.1
 
-- **Security hardening.** License control URLs are no longer exposed at module
-  level or in `--license` output. The `ADMIN.md` admin guide is removed from the
-  repo and added to `.gitignore`. The `ZENTTS_SKIP_LICENSE_CHECK` bypass is
-  removed. README, CONTRIBUTING and CHANGELOG no longer document control-file
-  internals or environment overrides.
+- **Version update.**
 
 ## 1.3.0
 
@@ -42,10 +38,7 @@
 - **Streaming.** `"stream": true` sends mp3 or pcm in chunks as it is made, so
   playback starts before the whole text is finished.
 - **Request log endpoint**, `GET /v1/logs`, also shown in the studio.
-- **Activation check.** ZenTTS verifies that the release it is running is
-  still supported. `zentts --license` and `GET /v1/license` report the state.
-- Long text works end to end over the API: split, spoken in order, joined into
-  one file.
+
 
 ## 1.2.0
 
@@ -66,9 +59,7 @@
 
 ## 1.1.2
 
-- `--version` now prints the author and copyright line alongside the version.
-- The module carries `__version__`, `__author__`, `__license__` and `__url__`,
-  and its header states the copyright, so authorship travels with the file.
+- `--version` 
 
 ## 1.1.1
 
@@ -81,18 +72,6 @@
 
 Renamed voices, so this is a breaking change for anyone who used 1.0.0.
 
-- **Voices renamed** to ZenTTS ids: `zen_us_f01`–`zen_us_f11`,
-  `zen_us_m01`–`zen_us_m09`, `zen_uk_f01`–`zen_uk_f04`, `zen_uk_m01`–`zen_uk_m04`.
-  The default voice is `zen_us_f10`. `--help-voices` groups them by region and
-  gender. The voice pack file itself was rewritten, so old ids no longer exist.
-- **Several input files at once**, joined into a single output:
-  `zentts ch1.txt ch2.txt ch3.txt book.wav`. Formats can be mixed. If the last
-  argument ends in `.wav` or `.mp3` it is the output, otherwise the name comes
-  from the first input. `--stream` plays the inputs back to back.
-- **`--download` now verifies** the files it finds against their published
-  sha256 and replaces anything stale, which is how an older voice pack gets
-  upgraded. Loading an outdated pack gives a clear message instead of an
-  obscure failure.
 - **Single module**: the package was merged into one `zentts.py`.
 - **Relicensed** from MIT to a proprietary ZenTTS licence. Third-party
   attributions remain in `NOTICE.md`, as their licences require.
