@@ -83,7 +83,9 @@ MODEL_VERSION = "v1.0"
 MODEL_FILENAME = f"zentts-{MODEL_VERSION}.onnx"
 VOICES_FILENAME = f"zentts-voices-{MODEL_VERSION}.bin"
 
-# Where the model files are published.
+# Where the model files are published. This tag tracks the model, not the
+# package version: every ZenTTS release that uses model v1.0 downloads from
+# here, so the files stay put and older installs keep working.
 RELEASE_TAG = "v1.0.0"
 RELEASE_BASE_URL = (
     f"https://github.com/OmorDeveloper/zentts/releases/download/{RELEASE_TAG}"
