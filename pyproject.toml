@@ -1,6 +1,6 @@
 [project]
 name = "zentts"
-version = "1.1.1"
+version = "1.1.2"
 description = "ZenTTS - a CLI text-to-speech tool for English audio, with EPUB and PDF input, chapter splitting and voice blending."
 readme = "README.md"
 requires-python = ">=3.11, <3.13"
@@ -46,7 +46,8 @@ zentts = "zentts:main"
 Homepage = "https://github.com/OmorDeveloper/zentts"
 Repository = "https://github.com/OmorDeveloper/zentts"
 Issues = "https://github.com/OmorDeveloper/zentts/issues"
-Author = "https://www.linkedin.com/in/omardeveloper/"
+Changelog = "https://github.com/OmorDeveloper/zentts/blob/master/CHANGELOG.md"
+LinkedIn = "https://www.linkedin.com/in/omardeveloper/"
 
 [build-system]
 requires = ["hatchling"]

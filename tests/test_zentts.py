@@ -7,7 +7,7 @@ a clean checkout.
 
 import hashlib
 import io
-import os
+import re
 import sys
 from pathlib import Path
 
@@ -157,6 +157,7 @@ def test_normalize_text_collapses_whitespace():
 
 
 def test_filter_english_voices_keeps_only_zentts_ids():
+    """Ids from an older voice pack must be filtered out, not offered."""
     voices = ["zen_us_f01", "af_sarah", "zen_uk_m04", "jf_alpha", "zen_us_m09"]
     assert zentts._filter_english_voices(voices) == [
         "zen_uk_m04",
@@ -376,6 +377,26 @@ def test_clean_title_drops_zero_width_spaces(tmp_path):
     pdf.write_bytes(b"%PDF-1.4\n")
     parser = zentts.PdfParser(str(pdf))
     assert parser._clean_title(" Chapter​One ") == "Chapter One"
+
+
+##############################################################################
+# Metadata
+##############################################################################
+
+
+def test_module_version_matches_pyproject():
+    pyproject = (Path(__file__).resolve().parent.parent / "pyproject.toml").read_text(
+        encoding="utf-8"
+    )
+    declared = re.search(r'^version = "([^"]+)"', pyproject, re.MULTILINE).group(1)
+    assert zentts.__version__ == declared
+
+
+def test_module_carries_its_authorship():
+    assert zentts.__author__ == "Omor"
+    assert zentts.__license__ == "Proprietary"
+    assert "OmorDeveloper/zentts" in zentts.__url__
+    assert "linkedin.com/in/omardeveloper" in zentts.__doc__
 
 
 ##############################################################################

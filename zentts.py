@@ -3,7 +3,19 @@
 
 Everything lives in this one module: configuration, the espeak-ng tokenizer,
 the ONNX engine, the model downloader and the CLI.
+
+Author:  Omor <omor.developer@gmail.com>
+         https://www.linkedin.com/in/omardeveloper/
+Project: https://github.com/OmorDeveloper/zentts
+
+Copyright (c) 2026 Omor. All rights reserved.
+Proprietary software - see LICENSE. Third-party notices in NOTICE.md.
 """
+
+__version__ = "1.1.2"
+__author__ = "Omor"
+__license__ = "Proprietary"
+__url__ = "https://github.com/OmorDeveloper/zentts"
 
 # Standard library imports
 import asyncio
@@ -2202,9 +2214,12 @@ def main():
 
     if "--version" in sys.argv or "-v" in sys.argv:
         try:
-            print(f"zentts version {importlib.metadata.version('zentts')}")
+            version = importlib.metadata.version("zentts")
         except importlib.metadata.PackageNotFoundError:
-            print("zentts version unknown (not installed)")
+            version = __version__
+        print(f"ZenTTS {version}")
+        print(f"By {__author__} - {__url__}")
+        print(f"Copyright (c) 2026 {__author__}. All rights reserved.")
         sys.exit(0)
     elif "--help" in sys.argv or "-h" in sys.argv:
         print_usage()

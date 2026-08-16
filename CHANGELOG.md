@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.2
+
+- `--version` now prints the author and copyright line alongside the version.
+- The module carries `__version__`, `__author__`, `__license__` and `__url__`,
+  and its header states the copyright, so authorship travels with the file.
+
 ## 1.1.1
 
 - Import `sounddevice` only when `--stream` is used, so `import zentts` no
@@ -39,6 +45,6 @@ old voice ids and a checksum that no longer matches the published voice pack.
 Use 1.1.1 or later.
 
 - English-only text-to-speech CLI for `.txt`, `.epub` and `.pdf` input
-- Self-contained engine, no `kokoro-onnx` dependency
+- Self-contained ZenTTS engine, with no third-party TTS package dependency
 - Automatic model download with progress and sha256 verification
 - Chapter splitting, resumable runs, chunk merging, voice blending, streaming
