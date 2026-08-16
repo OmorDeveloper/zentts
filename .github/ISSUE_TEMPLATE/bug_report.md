@@ -26,7 +26,8 @@ If applicable, add screenshots or terminal output to help explain your problem.
 ## Environment
 - OS: [e.g. Windows 10, macOS 11.2, Ubuntu 20.04]
 - Python version: [e.g. 3.12.0]
-- Voice model version: [e.g. ZENTTS-v1.0.onnx]
+- ZenTTS version: [output of `zentts --version`]
+- Model version: [e.g. zentts-v1.0.onnx]
 - Input format: [e.g. EPUB, PDF, TXT]
 
 ## Additional Context

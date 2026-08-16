@@ -1,97 +1,75 @@
-# Contributing to ZENTTS TTS
+# Contributing to ZenTTS
 
-Thank you for your interest in contributing to ZENTTS TTS! This document provides guidelines and instructions for contributing to this text-to-speech tool.
+Thanks for your interest in ZenTTS. This document covers how to set up the
+project and what a good contribution looks like.
 
-## Development Setup
+## Development setup
 
 1. Fork the repository
-2. Clone your fork: `git clone https://github.com/YOUR_USERNAME/ZENTTS-tts.git`
-3. Navigate to the project directory: `cd ZENTTS-tts`
+2. Clone your fork: `git clone https://github.com/YOUR_USERNAME/zentts.git`
+3. Enter the directory: `cd zentts`
 4. Create a virtual environment: `python -m venv .venv`
-5. Activate the virtual environment:
-   - On Windows: `.venv\Scripts\activate`
-   - On macOS/Linux: `source .venv/bin/activate`
-6. Install the dependencies: `pip install -r requirements.txt` or `uv sync`
-7. Download required model files as mentioned in the README.md
+5. Activate it:
+   - Windows: `.venv\Scripts\activate`
+   - macOS/Linux: `source .venv/bin/activate`
+6. Install the project: `pip install -e .` (or `uv sync`)
+7. Fetch the model files: `zentts --download`
 
-## Code Structure
+## Code structure
 
-- `ZENTTS-tts` - Main Python script with CLI functionality
-- `requirements.txt` - Project dependencies
-- `pyproject.toml` - Project configuration
-- Model files:
-  - `ZENTTS-v1.0.onnx` - The TTS model
-  - `voices-v1.0.bin` - Voice data for the model
+| Path | Purpose |
+| --- | --- |
+| `zentts/cli.py` | command-line interface, EPUB/PDF parsing, chunking, output |
+| `zentts/engine.py` | the `ZenTTS` class: ONNX inference and streaming |
+| `zentts/tokenizer.py` | text normalisation, phonemization, token encoding |
+| `zentts/models.py` | finding, downloading and verifying the model files |
+| `zentts/config.py` | languages, vocabulary, file names, release URLs |
+| `zentts/log.py` | logger, controlled by `LOG_LEVEL` |
 
-## Code Style Guidelines
+## Code style
 
-- Follow PEP 8 style guide for Python code
-- Use descriptive variable and function names
-- Add docstrings to functions and classes
-- Maintain consistent indentation (4 spaces)
-- Document new features or changes in the README.md
-- Group imports as follows:
-  - Standard library imports
-  - Third-party imports
-  - Local application imports
+- Follow PEP 8
+- Use descriptive names and add docstrings to functions and classes
+- 4-space indentation
+- Group imports: standard library, third-party, then local
+- Document user-facing changes in the README
 
-## Pull Request Guidelines
+## Scope
 
-Before submitting a pull request, please make sure that:
+ZenTTS is deliberately English-only (`en-us` and `en-gb`). Please don't send
+patches that add other languages — they widen the model surface the project
+supports and are out of scope.
 
-- Your code follows the project's coding style
-- You have tested your changes thoroughly
-- The commit messages are clear and descriptive and follow the conventions specified in [COMMIT_GUIDELINES.md](COMMIT_GUIDELINES.md)
-- You have documented your changes in the README.md if necessary
-- Your changes don't break existing functionality
-- You've added proper error handling where needed
+## Pull requests
 
-When opening a pull request, please use the provided pull request template. It helps ensure all necessary information is included.
+Before opening a PR, make sure that:
 
-## Submitting Changes
+- your code follows the style above
+- you tested your changes
+- your commit messages follow [COMMIT_GUIDELINES.md](COMMIT_GUIDELINES.md)
+- you updated the README where it matters
+- existing functionality still works
 
-1. Create a new branch: `git checkout -b feature/your-feature-name`
-2. Make your changes
-3. Test thoroughly
-4. Commit with clear messages following the guidelines in [COMMIT_GUIDELINES.md](COMMIT_GUIDELINES.md)
-5. Push to your fork: `git push origin feature/your-feature-name`
-6. Open a Pull Request against the main repository
-
-## Issue Reporting and Questions
-
-For bug reports and feature requests, please use the provided issue templates:
-- **Bug Report**: For reporting bugs or unexpected behavior
-- **Feature Request**: For suggesting new features or improvements
-
-For questions and discussions about the project, please use GitHub Discussions instead of opening an issue. This helps keep the issue tracker focused on bugs and features.
-
-When reporting issues, please:
-- Use a clear and descriptive title
-- Provide all the information requested in the issue template
-- Include steps to reproduce the problem (for bugs)
-- Specify your environment (OS, Python version, etc.)
-- Include any relevant error messages or logs
-- Check existing issues to avoid duplicates
-
-## Feature Requests
-
-Feature requests are welcome. To submit a feature request:
-
-- Use a clear and descriptive title
-- Provide a detailed description of the proposed feature
-- Explain why this feature would be useful to ZENTTS TTS users
-- If possible, suggest how it might be implemented
+Use the pull request template — it prompts for everything reviewers need.
 
 ## Testing
 
-Before submitting your changes, make sure to test:
+There is no automated test suite yet, so test by hand what your change touches:
 
-- Basic functionality with text files
-- EPUB processing if your changes affect it
-- PDF processing if your changes affect it
-- Voice blending if your changes affect it
-- Audio output quality and format options
+- plain `.txt` input to `.wav` and `.mp3`
+- EPUB and PDF chapter extraction
+- `--split-output`, resuming an interrupted run, and `--merge-chunks`
+- `--stream` playback
+- single voices and blended voices
+- a fresh `--download` on a machine with no cached model
+
+## Reporting issues
+
+Use the issue templates. Include your OS, Python version, the exact command you
+ran, and the full error output. Search existing issues first to avoid
+duplicates. For questions, use GitHub Discussions rather than the issue tracker.
 
 ## License
 
-By contributing to this project, you agree that your contributions will be licensed under the same [MIT License](LICENSE) as the project. 
+By contributing you agree that your contributions are licensed under the
+project's [MIT License](LICENSE).

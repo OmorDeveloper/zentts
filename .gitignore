@@ -5,24 +5,27 @@ build/
 dist/
 wheels/
 *.egg-info
-test.*
 .venv
+test.*
 *.bkp
+
+# Audio output
 *.wav
 *.mp3
 book_audio/
 chunks/
 
-*.npz
-*.bin
+# Model files (downloaded at runtime, never committed)
 *.onnx
+*.bin
+*.npz
+*.part
+
+# Book files
+*.epub
+*.pdf
+*.txt
+!requirements.txt
 
 # macOS
 .DS_Store
-
-# book files
-*.epub
-*.txt
-*.pdf
-!requirements.txt
-!demo.*

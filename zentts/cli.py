@@ -1,75 +1,64 @@
 #!/usr/bin/env python3
+"""Command-line interface for ZenTTS."""
 
 # Standard library imports
-import os
-import sys
+import difflib
+import importlib.metadata
 import itertools
+import os
+import re
+import signal
+import sys
 import threading
 import time
-import signal
-import difflib
 import warnings
-from threading import Event
-import re
-import importlib.metadata
 
 # Third-party imports
 import numpy as np
-from ebooklib import epub, ITEM_DOCUMENT
-from bs4 import BeautifulSoup
-import soundfile as sf
-import sounddevice as sd
-from kokoro_onnx import Kokoro
+import pymupdf
 import pymupdf4llm
-import fitz
+import sounddevice as sd
+import soundfile as sf
+from bs4 import BeautifulSoup
+from ebooklib import ITEM_DOCUMENT, epub
+
+# Local imports
+from .config import SUPPORTED_LANGUAGES, VOICE_PREFIXES
+from .engine import ZenTTS
+from .models import ensure_models, model_dir, resolve_model_files
 
 warnings.filterwarnings("ignore", category=UserWarning, module="ebooklib")
 warnings.filterwarnings("ignore", category=FutureWarning, module="ebooklib")
 
-# Global flag to stop the spinner and audio
+# Global flags to stop the spinner and audio
 stop_spinner = False
 stop_audio = False
 
-# English-only voice prefixes (US female/male, UK female/male)
-ENGLISH_VOICE_PREFIXES = ("af_", "am_", "bf_", "bm_")
-ENGLISH_LANGUAGES = ("en-us", "en-gb")
+DEFAULT_VOICE = "af_sarah"
 
 
 def _filter_english_voices(voices):
-    """Keep only US/UK English voices from a voice list."""
-    return sorted(v for v in voices if v.startswith(ENGLISH_VOICE_PREFIXES))
+    """Keep only the US/UK English voices from a voice list."""
+    return sorted(v for v in voices if v.startswith(VOICE_PREFIXES))
 
 
 def _filter_english_languages(languages):
     """Keep only English language codes from a language list."""
-    return sorted(l for l in languages if l in ENGLISH_LANGUAGES)
+    return sorted(l for l in languages if l in SUPPORTED_LANGUAGES)
 
 
-def check_required_files(model_path="ZENTTS-v1.0.onnx", voices_path="voices-v1.0.bin"):
-    """Check if required model files exist and provide helpful error messages."""
-    # NOTE: point these at your own GitHub release once you've uploaded the
-    # renamed model files there.
-    required_files = {
-        model_path: "https://github.com/YOUR_GITHUB_USERNAME/zentts/releases/download/v1.0.0/ZENTTS-v1.0.onnx",
-        voices_path: "https://github.com/YOUR_GITHUB_USERNAME/zentts/releases/download/v1.0.0/voices-v1.0.bin",
-    }
+def load_engine(model_path=None, voices_path=None):
+    """Resolve the model files (downloading on first run) and load the engine."""
+    try:
+        model, voices = resolve_model_files(model_path, voices_path)
+    except (FileNotFoundError, RuntimeError) as e:
+        print(f"Error: {e}")
+        sys.exit(1)
 
-    missing_files = []
-    for filepath, download_url in required_files.items():
-        if not os.path.exists(filepath):
-            missing_files.append((filepath, download_url))
-
-    if missing_files:
-        print("Error: Required model files are missing:")
-        for filepath, download_url in missing_files:
-            print(f"  • {filepath}")
-        print("\nYou can download the missing files using these commands:")
-        for filepath, download_url in missing_files:
-            print(f"  wget {download_url}")
-        print(
-            f"\nPlace the downloaded files in the same directory where you run the `zentts` command."
-        )
-        print(f"Or specify custom paths using --model and --voices options.")
+    try:
+        return ZenTTS(model, voices)
+    except Exception as e:
+        print(f"Error loading the ZenTTS model: {e}")
         sys.exit(1)
 
 
@@ -156,22 +145,20 @@ def chunk_text(text, initial_chunk_size=1000):
 
 
 def validate_language(lang, engine):
-    """Validate if the language is supported (English only)."""
-    try:
-        supported_languages = set(_filter_english_languages(engine.get_languages()))
-        if lang not in supported_languages:
-            supported_langs = ", ".join(sorted(supported_languages))
-            raise ValueError(
-                f"Unsupported language: {lang}\nSupported languages are: {supported_langs}"
-            )
-        return lang
-    except Exception as e:
-        print(f"Error getting supported languages: {e}")
+    """Validate that the language is supported (English only)."""
+    supported_languages = set(_filter_english_languages(engine.get_languages()))
+    if lang not in supported_languages:
+        supported_langs = ", ".join(sorted(supported_languages))
+        print(f"Error: Unsupported language: {lang}")
+        print(f"Supported languages are: {supported_langs}")
         sys.exit(1)
+    return lang
 
 
 def print_usage():
     print("""
+ZenTTS - English text-to-speech from the command line
+
 Usage: zentts <input_text_file> [<output_audio_file>] [options]
 
 Commands:
@@ -179,28 +166,34 @@ Commands:
     -v, --version      Show the version number
     --help-languages   List all supported languages
     --help-voices      List all available voices
+    --download         Download the ZenTTS model files and exit
     --merge-chunks     Merge existing chunks in split-output directory into chapter files
 
 Options:
     --stream            Stream audio instead of saving to file
-    --speed <float>     Set speech speed (default: 1.0)
-    --lang <str>        Set language (default: en-us)
+    --speed <float>     Set speech speed, 0.5 to 2.0 (default: 1.0)
+    --lang <str>        Set language: en-us or en-gb (default: en-us)
     --voice <str>       Set voice or blend voices (default: interactive selection)
     --split-output <dir> Save each chunk as separate file in directory
     --format <str>      Audio format: wav or mp3 (default: wav)
     --debug             Show detailed debug information
-    --model <path>      Path to ZENTTS-v1.0.onnx model file (default: ./ZENTTS-v1.0.onnx)
-    --voices <path>     Path to voices-v1.0.bin file (default: ./voices-v1.0.bin)
+    --model <path>      Path to the ZenTTS .onnx model file
+    --voices <path>     Path to the ZenTTS voices .bin file
 
 Input formats:
     .txt               Text file input
     .epub              EPUB book input (will process chapters)
     .pdf               PDF document input (extracts chapters from TOC or content)
 
+Model files:
+    On first run ZenTTS downloads the model files automatically and caches them in
+    {cache}. Set ZENTTS_HOME to change that location, or ZENTTS_NO_DOWNLOAD=1 to
+    disable downloading.
+
 Examples:
     zentts input.txt output.wav --speed 1.2 --lang en-us --voice af_sarah
     zentts input.epub --split-output ./chunks/ --format mp3
-    zentts input.pdf output.wav --speed 1.2 --lang en-us --voice af_sarah
+    zentts input.pdf output.wav --speed 1.2 --lang en-gb --voice bf_emma
     zentts input.pdf --split-output ./chunks/ --format mp3
     zentts input.txt --stream --speed 0.8
     zentts input.txt output.wav --voice "af_sarah:60,am_adam:40"
@@ -210,53 +203,36 @@ Examples:
     zentts --help-languages
     zentts input.epub --split-output ./chunks/ --debug
     zentts input.txt output.wav --model /path/to/model.onnx --voices /path/to/voices.bin
-    zentts input.txt --model ./models/ZENTTS-v1.0.onnx --voices ./models/voices-v1.0.bin
-    """)
+""".replace("{cache}", str(model_dir())))
 
 
-def print_supported_languages(
-    model_path="ZENTTS-v1.0.onnx", voices_path="voices-v1.0.bin"
-):
+def print_supported_languages(model_path=None, voices_path=None):
     """Print all supported (English) languages."""
-    check_required_files(model_path, voices_path)
-    try:
-        engine = Kokoro(model_path, voices_path)
-        languages = _filter_english_languages(engine.get_languages())
-        print("\nSupported languages:")
-        for lang in languages:
-            print(f"    {lang}")
-        print()
-    except Exception as e:
-        print(f"Error loading model to get supported languages: {e}")
-        sys.exit(1)
+    engine = load_engine(model_path, voices_path)
+    print("\nSupported languages:")
+    for lang in _filter_english_languages(engine.get_languages()):
+        print(f"    {lang}")
+    print()
 
 
-def print_supported_voices(
-    model_path="ZENTTS-v1.0.onnx", voices_path="voices-v1.0.bin"
-):
+def print_supported_voices(model_path=None, voices_path=None):
     """Print all supported (English) voices."""
-    check_required_files(model_path, voices_path)
-    try:
-        engine = Kokoro(model_path, voices_path)
-        voices = _filter_english_voices(engine.get_voices())
-        print("\nSupported voices:")
-        for idx, voice in enumerate(voices):
-            print(f"    {idx + 1}. {voice}")
-        print()
-    except Exception as e:
-        print(f"Error loading model to get supported voices: {e}")
-        sys.exit(1)
+    engine = load_engine(model_path, voices_path)
+    print("\nSupported voices:")
+    for idx, voice in enumerate(_filter_english_voices(engine.get_voices())):
+        print(f"    {idx + 1}. {voice}")
+    print()
 
 
 def validate_voice(voice, engine):
-    """Validate if the voice is supported (English only) and handle voice blending.
+    """Validate a voice name (English only) and handle voice blending.
 
     Format for blended voices: "voice1:weight,voice2:weight"
-    Example: "af_sarah:60,am_adam:40" for 60-40 blend
+    Example: "af_sarah:60,am_adam:40" for a 60-40 blend
     """
-    try:
-        supported_voices = set(_filter_english_voices(engine.get_voices()))
+    supported_voices = set(_filter_english_voices(engine.get_voices()))
 
+    try:
         if "," in voice:
             voices = []
             weights = []
@@ -286,8 +262,7 @@ def validate_voice(voice, engine):
 
             style1 = engine.get_voice_style(voices[0])
             style2 = engine.get_voice_style(voices[1])
-            blend = np.add(style1 * (weights[0] / 100), style2 * (weights[1] / 100))
-            return blend
+            return np.add(style1 * (weights[0] / 100), style2 * (weights[1] / 100))
 
         if voice not in supported_voices:
             supported_voices_list = ", ".join(sorted(supported_voices))
@@ -295,13 +270,13 @@ def validate_voice(voice, engine):
                 f"Unsupported voice: {voice}\nSupported voices are: {supported_voices_list}"
             )
         return voice
-    except Exception as e:
-        print(f"Error getting supported voices: {e}")
+    except ValueError as e:
+        print(f"Error: {e}")
         sys.exit(1)
 
 
 def extract_chapters_from_epub(epub_file, debug=False):
-    """Extract chapters from epub file using ebooklib's metadata and TOC."""
+    """Extract chapters from an EPUB file using ebooklib's metadata and TOC."""
     if not os.path.exists(epub_file):
         raise FileNotFoundError(f"EPUB file not found: {epub_file}")
 
@@ -328,7 +303,7 @@ def extract_chapters_from_epub(epub_file, debug=False):
         print_toc(book.toc)
 
     def get_chapter_content(soup, start_id, next_id=None):
-        """Extract content between two fragment IDs"""
+        """Extract content between two fragment IDs."""
         content = []
         start_elem = soup.find(id=start_id)
 
@@ -533,8 +508,8 @@ def extract_chapters_from_epub(epub_file, debug=False):
 class PdfParser:
     """Parser for extracting chapters from PDF files.
 
-    Attempts to extract chapters first from table of contents,
-    then falls back to markdown-based extraction if TOC fails.
+    Attempts to extract chapters first from the table of contents,
+    then falls back to markdown-based extraction if that fails.
     """
 
     def __init__(
@@ -567,7 +542,7 @@ class PdfParser:
         self.chapters = self.get_chapters_from_markdown()
 
         if self.debug:
-            print(f"\nDEBUG: Markdown extraction complete")
+            print("\nDEBUG: Markdown extraction complete")
             print(f"DEBUG: Found {len(self.chapters)} chapters")
 
         return self.chapters
@@ -575,7 +550,7 @@ class PdfParser:
     def get_chapters_from_toc(self):
         doc = None
         try:
-            doc = fitz.open(self.pdf_path)
+            doc = pymupdf.open(self.pdf_path)
             toc = doc.get_toc()
 
             if not toc:
@@ -617,7 +592,7 @@ class PdfParser:
 
             for i, (title, start_page) in enumerate(chapter_markers):
                 if self.debug:
-                    print(f"\nDEBUG: Processing chapter {i+1}/{len(chapter_markers)}")
+                    print(f"\nDEBUG: Processing chapter {i + 1}/{len(chapter_markers)}")
                     print(f"DEBUG: Title: {title}")
                     print(f"DEBUG: Start page: {start_page}")
 
@@ -709,7 +684,7 @@ class PdfParser:
 
     def _clean_title(self, title: str) -> str:
         """Clean up chapter title text."""
-        return title.strip().replace("\u200b", " ")
+        return title.strip().replace("​", " ")
 
     def _clean_markdown(self, text: str) -> str:
         """Clean up converted markdown text."""
@@ -735,14 +710,14 @@ class PdfParser:
 
 def process_chunk_sequential(
     chunk: str,
-    engine: Kokoro,
+    engine: ZenTTS,
     voice: str,
     speed: float,
     lang: str,
     retry_count=0,
     debug=False,
 ):
-    """Process a single chunk of text sequentially with automatic chunk size adjustment."""
+    """Process a single chunk of text, splitting it further if it is too long."""
     try:
         if debug:
             sys.stdout.write("\033[K")
@@ -833,16 +808,14 @@ def process_chunk_sequential(
 
             if debug:
                 sys.stdout.write("\033[K")
-                sys.stdout.write(
-                    f"\nDEBUG: Failed to process any pieces after splitting"
-                )
+                sys.stdout.write("\nDEBUG: Failed to process any pieces after splitting")
                 sys.stdout.write("\n")
             sys.stdout.flush()
 
         if not debug:
             sys.stdout.write("\033[K")
             sys.stdout.write(
-                f"\rError: Unable to process text segment. Try using smaller chunks or enable debug mode for details."
+                "\rError: Unable to process text segment. Try using smaller chunks or enable debug mode for details."
             )
         else:
             sys.stdout.write("\033[K")
@@ -866,76 +839,63 @@ def convert_text_to_audio(
     format="wav",
     debug=False,
     stdin_indicators=None,
-    model_path="ZENTTS-v1.0.onnx",
-    voices_path="voices-v1.0.bin",
+    model_path=None,
+    voices_path=None,
 ):
     global stop_spinner
 
     if stdin_indicators is None:
         stdin_indicators = ["/dev/stdin", "-", "CONIN$"]
 
-    check_required_files(model_path, voices_path)
+    engine = load_engine(model_path, voices_path)
 
-    try:
-        engine = Kokoro(model_path, voices_path)
+    lang = validate_language(lang, engine)
 
-        lang = validate_language(lang, engine)
-
-        if voice:
-            voice = validate_voice(voice, engine)
+    if voice:
+        voice = validate_voice(voice, engine)
+    else:
+        if input_file in stdin_indicators:
+            print(f"Using stdin - automatically selecting default voice ({DEFAULT_VOICE})")
+            voice = DEFAULT_VOICE
         else:
-            if input_file in stdin_indicators:
-                print("Using stdin - automatically selecting default voice (af_sarah)")
-                voice = "af_sarah"
-            else:
-                voices = list_available_voices(engine)
-                print("\nHow to choose a voice:")
-                print("You can use either a single voice or blend two voices together.")
-                print("\nFor a single voice:")
-                print("  • Just enter one number (example: '7')")
-                print("\nFor blending two voices:")
-                print("  • Enter two numbers separated by comma")
-                print("  • Optionally add weights after each number using ':weight'")
-                print("\nExamples:")
-                print("  • '7'      - Use voice #7 only")
-                print("  • '7,11'   - Mix voices #7 and #11 equally (50% each)")
-                print("  • '7:60,11:40' - Mix 60% of voice #7 with 40% of voice #11")
-                try:
-                    voice_input = input("Choose voice(s) by number: ")
-                    if "," in voice_input:
-                        pairs = []
-                        for pair in voice_input.split(","):
-                            if ":" in pair:
-                                num, weight = pair.strip().split(":")
-                                voice_idx = int(num.strip()) - 1
-                                if not (0 <= voice_idx < len(voices)):
-                                    raise ValueError(
-                                        f"Invalid voice number: {int(num)}"
-                                    )
-                                pairs.append(f"{voices[voice_idx]}:{weight}")
-                            else:
-                                voice_idx = int(pair.strip()) - 1
-                                if not (0 <= voice_idx < len(voices)):
-                                    raise ValueError(
-                                        f"Invalid voice number: {int(pair)}"
-                                    )
-                                pairs.append(voices[voice_idx])
-                        voice = ",".join(pairs)
-                    else:
-                        voice_choice = int(voice_input) - 1
-                        if not (0 <= voice_choice < len(voices)):
-                            raise ValueError("Invalid choice")
-                        voice = voices[voice_choice]
-                    voice = validate_voice(voice, engine)
-                except (ValueError, IndexError):
-                    print("Invalid choice. Using default voice.")
-                    voice = "af_sarah"
-    except ValueError as e:
-        print(f"Error: {e}")
-        sys.exit(1)
-    except Exception as e:
-        print(f"Error loading ZENTTS model: {e}")
-        sys.exit(1)
+            voices = list_available_voices(engine)
+            print("\nHow to choose a voice:")
+            print("You can use either a single voice or blend two voices together.")
+            print("\nFor a single voice:")
+            print("  • Just enter one number (example: '7')")
+            print("\nFor blending two voices:")
+            print("  • Enter two numbers separated by comma")
+            print("  • Optionally add weights after each number using ':weight'")
+            print("\nExamples:")
+            print("  • '7'      - Use voice #7 only")
+            print("  • '7,11'   - Mix voices #7 and #11 equally (50% each)")
+            print("  • '7:60,11:40' - Mix 60% of voice #7 with 40% of voice #11")
+            try:
+                voice_input = input("Choose voice(s) by number: ")
+                if "," in voice_input:
+                    pairs = []
+                    for pair in voice_input.split(","):
+                        if ":" in pair:
+                            num, weight = pair.strip().split(":")
+                            voice_idx = int(num.strip()) - 1
+                            if not (0 <= voice_idx < len(voices)):
+                                raise ValueError(f"Invalid voice number: {int(num)}")
+                            pairs.append(f"{voices[voice_idx]}:{weight}")
+                        else:
+                            voice_idx = int(pair.strip()) - 1
+                            if not (0 <= voice_idx < len(voices)):
+                                raise ValueError(f"Invalid voice number: {int(pair)}")
+                            pairs.append(voices[voice_idx])
+                    voice = ",".join(pairs)
+                else:
+                    voice_choice = int(voice_input) - 1
+                    if not (0 <= voice_choice < len(voices)):
+                        raise ValueError("Invalid choice")
+                    voice = voices[voice_choice]
+                voice = validate_voice(voice, engine)
+            except (ValueError, IndexError):
+                print("Invalid choice. Using default voice.")
+                voice = DEFAULT_VOICE
 
     if input_file.endswith(".epub"):
         chapters = extract_chapters_from_epub(input_file, debug)
@@ -981,7 +941,6 @@ def convert_text_to_audio(
 
         for chapter in chapters:
             print(f"\nStreaming: {chapter['title']}")
-            chunks = chunk_text(chapter["content"], initial_chunk_size=1000)
             asyncio.run(
                 stream_audio(engine, chapter["content"], voice, speed, lang, debug)
             )
@@ -1085,9 +1044,7 @@ def convert_text_to_audio(
                 if stop_audio:
                     break
 
-            print(
-                f"\nCreated audio files for {len(chapters)} chapters in {split_output}/"
-            )
+            print(f"\nCreated audio files for {len(chapters)} chapters in {split_output}/")
         else:
             all_samples = []
             sample_rate = None
@@ -1153,7 +1110,6 @@ async def stream_audio(engine, text, voice, speed, lang, debug=False):
     for i, chunk in enumerate(chunks, 1):
         if stop_audio:
             break
-        progress = int((i / len(chunks)) * 100)
         spinner_thread = threading.Thread(
             target=spinning_wheel, args=(f"Streaming chunk {i}/{len(chunks)}",)
         )
@@ -1270,9 +1226,7 @@ def merge_chunks_to_chapters(split_output_dir, format="wav"):
                     print(f"\nWarning: Sample rate mismatch in {chunk_file}")
                     continue
 
-                chunk_duration = len(data) / sr
-                total_duration += chunk_duration
-
+                total_duration += len(data) / sr
                 all_samples.extend(data)
                 processed_chunks += 1
 
@@ -1305,12 +1259,13 @@ def merge_chunks_to_chapters(split_output_dir, format="wav"):
 
 
 def get_valid_options():
-    """Return a set of valid command line options"""
+    """Return the set of valid command line options."""
     return {
         "-h",
         "--help",
         "--help-languages",
         "--help-voices",
+        "--download",
         "--merge-chunks",
         "--stream",
         "--speed",
@@ -1324,6 +1279,18 @@ def get_valid_options():
         "-v",
         "--version",
     }
+
+
+def _read_model_options(argv):
+    """Pull --model / --voices out of the arguments, if present."""
+    model_path = None
+    voices_path = None
+    for i, arg in enumerate(argv):
+        if arg == "--model" and i + 1 < len(argv):
+            model_path = argv[i + 1]
+        elif arg == "--voices" and i + 1 < len(argv):
+            voices_path = argv[i + 1]
+    return model_path, voices_path
 
 
 def main():
@@ -1363,36 +1330,26 @@ def main():
 
     if "--version" in sys.argv or "-v" in sys.argv:
         try:
-            print(f"zentts version {importlib.metadata.version('zentts-tts')}")
+            print(f"zentts version {importlib.metadata.version('zentts')}")
         except importlib.metadata.PackageNotFoundError:
             print("zentts version unknown (not installed)")
         sys.exit(0)
     elif "--help" in sys.argv or "-h" in sys.argv:
         print_usage()
         sys.exit(0)
+    elif "--download" in sys.argv:
+        try:
+            model, voices = ensure_models()
+        except RuntimeError as e:
+            print(f"Error: {e}")
+            sys.exit(1)
+        print(f"\nModel files ready:\n  {model}\n  {voices}")
+        sys.exit(0)
     elif "--help-languages" in sys.argv:
-        model_path = "ZENTTS-v1.0.onnx"
-        voices_path = "voices-v1.0.bin"
-
-        for i, arg in enumerate(sys.argv):
-            if arg == "--model" and i + 1 < len(sys.argv):
-                model_path = sys.argv[i + 1]
-            elif arg == "--voices" and i + 1 < len(sys.argv):
-                voices_path = sys.argv[i + 1]
-
-        print_supported_languages(model_path, voices_path)
+        print_supported_languages(*_read_model_options(sys.argv))
         sys.exit(0)
     elif "--help-voices" in sys.argv:
-        model_path = "ZENTTS-v1.0.onnx"
-        voices_path = "voices-v1.0.bin"
-
-        for i, arg in enumerate(sys.argv):
-            if arg == "--model" and i + 1 < len(sys.argv):
-                model_path = sys.argv[i + 1]
-            elif arg == "--voices" and i + 1 < len(sys.argv):
-                voices_path = sys.argv[i + 1]
-
-        print_supported_voices(model_path, voices_path)
+        print_supported_voices(*_read_model_options(sys.argv))
         sys.exit(0)
 
     input_file = None
@@ -1413,8 +1370,7 @@ def main():
     split_output = None
     format = "wav"
     merge_chunks = "--merge-chunks" in sys.argv
-    model_path = "ZENTTS-v1.0.onnx"
-    voices_path = "voices-v1.0.bin"
+    model_path, voices_path = _read_model_options(sys.argv)
 
     for i, arg in enumerate(sys.argv):
         if arg == "--speed" and i + 1 < len(sys.argv):
@@ -1422,6 +1378,9 @@ def main():
                 speed = float(sys.argv[i + 1])
             except ValueError:
                 print("Error: Speed must be a number")
+                sys.exit(1)
+            if not 0.5 <= speed <= 2.0:
+                print("Error: Speed must be between 0.5 and 2.0")
                 sys.exit(1)
         elif arg == "--lang" and i + 1 < len(sys.argv):
             lang = sys.argv[i + 1]
@@ -1434,10 +1393,6 @@ def main():
             if format not in ["wav", "mp3"]:
                 print("Error: Format must be either 'wav' or 'mp3'")
                 sys.exit(1)
-        elif arg == "--model" and i + 1 < len(sys.argv):
-            model_path = sys.argv[i + 1]
-        elif arg == "--voices" and i + 1 < len(sys.argv):
-            voices_path = sys.argv[i + 1]
 
     if merge_chunks:
         if not split_output:
@@ -1459,7 +1414,7 @@ def main():
         )
         sys.exit(1)
 
-    if output_file and not output_file.endswith(("." + format)):
+    if output_file and not output_file.endswith("." + format):
         print(f"Error: Output file must have .{format} extension.")
         sys.exit(1)
 

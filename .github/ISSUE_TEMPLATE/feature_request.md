@@ -17,7 +17,7 @@ A clear and concise description of what you want to happen.
 A clear and concise description of any alternative solutions or features you've considered.
 
 ## User Impact
-How would this feature benefit users of the ZENTTS TTS tool?
+How would this feature benefit ZenTTS users?
 
 ## Implementation Ideas
 If you have any ideas on how this could be implemented, share them here.

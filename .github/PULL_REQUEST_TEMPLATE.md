@@ -17,12 +17,12 @@ Fixes #
 
 ## Checklist
 <!-- Mark completed items with an "x" -->
-- [ ] I created a feature branch for this change (not working directly on main/master)
+- [ ] I created a feature branch for this change (not working directly on master)
       <!-- Example: git checkout -b feature/voice-blending or fix/epub-parsing-bug -->
 - [ ] My code follows the project's coding style
 - [ ] I have tested my changes thoroughly
 - [ ] I have updated documentation as needed
-- [ ] My commits follow the [commit message guidelines](../blob/main/CONTRIBUTING.md)
+- [ ] My commits follow the [commit message guidelines](../blob/master/CONTRIBUTING.md)
 - [ ] I have added tests that prove my fix/feature works
 - [ ] New and existing tests pass with my changes
 
