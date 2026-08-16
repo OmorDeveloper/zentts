@@ -3,6 +3,5 @@
   "message": "",
   "min_version": "1.0.0",
   "blocked_versions": [],
-  "require_package": true,
-  "_comment": "Admin control file for every ZenTTS install that can reach it. Set enabled to false to stop all of them; put a version in blocked_versions to stop that one; raise min_version to force an upgrade. Installs cache the last good answer and keep working offline for 7 days."
+  "require_package": true
 }

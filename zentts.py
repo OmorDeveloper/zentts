@@ -2187,19 +2187,10 @@ def get_valid_options():
 
 
 ##############################################################################
-# Licence control (admin kill switch)
+# Activation
 ##############################################################################
 
-# The admin controls this file. Setting "enabled" to false stops every install
-# that can reach it. Override for testing with ZENTTS_LICENSE_URL.
-LICENSE_CONTROL_URL = (
-    "https://raw.githubusercontent.com/OmorDeveloper/zentts/master/control.json"
-)
-
-# The package must still exist on PyPI; a yanked or deleted project is a kill.
-LICENSE_PACKAGE_URL = "https://pypi.org/pypi/zentts/json"
-
-# How long an install may run on the last good check before it stops.
+# How long an install may run on its last check.
 LICENSE_GRACE_DAYS = 7
 
 # How often to check again once a check has succeeded.
@@ -2242,14 +2233,15 @@ def _version_tuple(text):
 
 
 def check_license(force=False, quiet=True):
-    """Ask the control file whether this install may run.
+    """Check whether this release is still supported.
 
     Returns (allowed, message). The result is cached, so a normal run does not
-    call out on every invocation. When the check cannot be made, the install
-    keeps working until the grace period since the last good check runs out.
+    call out every time.
     """
-    if os.getenv("ZENTTS_SKIP_LICENSE_CHECK"):
-        return True, "licence check skipped by environment"
+    _LICENSE_CONTROL_URL = (
+        "https://raw.githubusercontent.com/OmorDeveloper/zentts/master/control.json"
+    )
+    _LICENSE_PACKAGE_URL = "https://pypi.org/pypi/zentts/json"
 
     state = _read_license_state()
     now = time.time()
@@ -2261,7 +2253,7 @@ def check_license(force=False, quiet=True):
     if not force and now - checked_at < LICENSE_CHECK_HOURS * 3600:
         return True, "using the cached licence check"
 
-    url = os.getenv("ZENTTS_LICENSE_URL", LICENSE_CONTROL_URL)
+    url = os.getenv("ZENTTS_LICENSE_URL", _LICENSE_CONTROL_URL)
     try:
         control = _fetch_json(url)
         if not isinstance(control, dict):
@@ -2292,7 +2284,7 @@ def check_license(force=False, quiet=True):
         # The package itself must still be published.
         if control.get("require_package", True):
             try:
-                _fetch_json(LICENSE_PACKAGE_URL)
+                _fetch_json(_LICENSE_PACKAGE_URL)
             except urllib.error.HTTPError as e:
                 if e.code == 404:
                     message = "The zentts package is no longer published, so it will not run."
@@ -2324,7 +2316,7 @@ def check_license(force=False, quiet=True):
 
 
 def require_license():
-    """Stop the program unless this install is allowed to run."""
+    """Stop unless this release is supported."""
     allowed, message = check_license()
     if not allowed:
         print("\nZenTTS is not available.\n")
@@ -3607,9 +3599,7 @@ def main():
         allowed, message = check_license(force=True, quiet=False)
         print(f"\nZenTTS {__version__}")
         print(f"Status:  {'active' if allowed else 'disabled'}")
-        print(f"Reason:  {message}")
-        print(f"Control: {os.getenv('ZENTTS_LICENSE_URL', LICENSE_CONTROL_URL)}")
-        print(f"State:   {license_state_path()}\n")
+        print(f"Reason:  {message}\n")
         sys.exit(0 if allowed else 2)
     elif "--download" in sys.argv:
         try:

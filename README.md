@@ -49,8 +49,6 @@ on macOS and `~/.cache/zentts` on Linux.
 | `ZENTTS_HOME` | store the model files somewhere else |
 | `ZENTTS_NO_DOWNLOAD=1` | never download; use `--model` / `--voices` instead |
 | `ZENTTS_API_KEY` | bearer token the server requires |
-| `ZENTTS_LICENSE_URL` | control file the licence check reads |
-| `ZENTTS_SKIP_LICENSE_CHECK=1` | skip the licence check |
 | `ONNX_PROVIDER` | force an ONNX Runtime execution provider |
 | `LOG_LEVEL=DEBUG` | verbose engine logging |
 
@@ -305,19 +303,6 @@ Writing audio to a file works anywhere. `--stream` plays through your speakers,
 so it additionally needs the PortAudio system library — already present on
 Windows and macOS, and installed on Debian or Ubuntu with
 `sudo apt install libportaudio2`.
-
-## Licensing and remote control
-
-ZenTTS checks a control file the author owns before it runs, so a release can
-be withdrawn or a version forced to upgrade. The result is cached, and an
-install that has checked in keeps working offline for seven days.
-
-```bash
-zentts --license      # status of this install
-```
-
-Owners: see [ADMIN.md](ADMIN.md). Set `ZENTTS_SKIP_LICENSE_CHECK=1` to bypass
-it while developing.
 
 ## License
 

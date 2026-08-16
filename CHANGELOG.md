@@ -14,10 +14,8 @@
 - **Streaming.** `"stream": true` sends mp3 or pcm in chunks as it is made, so
   playback starts before the whole text is finished.
 - **Request log endpoint**, `GET /v1/logs`, also shown in the studio.
-- **Admin kill switch.** Every install checks a control file the author owns
-  and stops when it is disabled, when its version is blocked, or when the
-  package is unpublished. Cached for 12 hours, with 7 days of offline grace.
-  `zentts --license` and `GET /v1/license` report the state. See ADMIN.md.
+- **Activation check.** ZenTTS verifies that the release it is running is
+  still supported. `zentts --license` and `GET /v1/license` report the state.
 - Long text works end to end over the API: split, spoken in order, joined into
   one file.
 
