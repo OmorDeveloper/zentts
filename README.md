@@ -148,6 +148,11 @@ Python 3.11 or 3.12. Everything else is installed by pip. `--format mp3` needs
 `libsndfile` with MP3 support, which ships with the `soundfile` wheels on
 Windows, macOS and Linux.
 
+Writing audio to a file works anywhere. `--stream` plays through your speakers,
+so it additionally needs the PortAudio system library — already present on
+Windows and macOS, and installed on Debian or Ubuntu with
+`sudo apt install libportaudio2`.
+
 ## License
 
 ZenTTS is proprietary software, © 2026 Omor, all rights reserved — see

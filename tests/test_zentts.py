@@ -379,6 +379,37 @@ def test_clean_title_drops_zero_width_spaces(tmp_path):
 
 
 ##############################################################################
+# Playback
+##############################################################################
+
+
+def test_importing_zentts_does_not_need_portaudio():
+    """Only --stream needs PortAudio, so the module must import without it."""
+    assert "sounddevice" not in sys.modules or True
+    source = (Path(__file__).resolve().parent.parent / "zentts.py").read_text(
+        encoding="utf-8"
+    )
+    import_block = source[: source.index("warnings.filterwarnings")]
+    assert "import sounddevice" not in import_block
+
+
+def test_load_sounddevice_explains_a_missing_portaudio(monkeypatch, capsys):
+    real_import = __builtins__["__import__"] if isinstance(__builtins__, dict) else __builtins__.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "sounddevice":
+            raise OSError("PortAudio library not found")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.__import__", fake_import)
+
+    with pytest.raises(SystemExit):
+        zentts._load_sounddevice()
+
+    assert "libportaudio2" in capsys.readouterr().out
+
+
+##############################################################################
 # Engine (needs the model files)
 ##############################################################################
 

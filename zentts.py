@@ -36,7 +36,6 @@ import onnxruntime as rt
 import phonemizer
 import pymupdf
 import pymupdf4llm
-import sounddevice as sd
 import soundfile as sf
 from bs4 import BeautifulSoup
 from ebooklib import ITEM_DOCUMENT, epub
@@ -1906,10 +1905,27 @@ def convert_text_to_audio(
                 print(f"Created {output_file}")
 
 
+def _load_sounddevice():
+    """Import sounddevice on demand, since only streaming needs PortAudio."""
+    try:
+        import sounddevice as sd
+    except OSError as e:
+        print(
+            f"Error: audio playback is unavailable ({e}).\n"
+            "Streaming needs the PortAudio library. On Debian or Ubuntu install\n"
+            "it with `sudo apt install libportaudio2`, or drop --stream and write\n"
+            "the audio to a file instead."
+        )
+        sys.exit(1)
+    return sd
+
+
 async def stream_audio(engine, text, voice, speed, lang, debug=False):
     global stop_spinner, stop_audio
     stop_spinner = False
     stop_audio = False
+
+    sd = _load_sounddevice()
 
     print("Starting audio stream...")
     chunks = chunk_text(text, initial_chunk_size=1000)
