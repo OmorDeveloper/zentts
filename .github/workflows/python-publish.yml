@@ -6,6 +6,8 @@ name: Publish ZenTTS to PyPI
 on:
   release:
     types: [published]
+  # Lets you publish an already-published release, or re-run a failed upload.
+  workflow_dispatch:
 
 permissions:
   contents: read
