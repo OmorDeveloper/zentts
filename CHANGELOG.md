@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.3.3
+
+- **Fix Termux/Android install.** Lowered the `espeakng-loader` minimum from
+  `>=0.2.4` to `>=0.1.3`. Versions 0.2.x ship wheels only, with no Android/Termux
+  build; 0.1.3 provides an sdist that compiles on Termux.
+
 ## 1.3.2
 
 - **Python 3.13 supported.** The `requires-python` bound is now `>=3.11` with no
