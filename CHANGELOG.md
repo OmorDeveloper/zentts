@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.3.1
+
+- **Security hardening.** License control URLs are no longer exposed at module
+  level or in `--license` output. The `ADMIN.md` admin guide is removed from the
+  repo and added to `.gitignore`. The `ZENTTS_SKIP_LICENSE_CHECK` bypass is
+  removed. README, CONTRIBUTING and CHANGELOG no longer document control-file
+  internals or environment overrides.
+
 ## 1.3.0
 
 - **Web studio.** `zentts start` now serves a browser interface at `/`: text
