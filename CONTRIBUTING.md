@@ -17,14 +17,16 @@ project and what a good contribution looks like.
 
 ## Code structure
 
-| Path | Purpose |
+Everything lives in one module, `zentts.py`, in these sections:
+
+| Section | Purpose |
 | --- | --- |
-| `zentts/cli.py` | command-line interface, EPUB/PDF parsing, chunking, output |
-| `zentts/engine.py` | the `ZenTTS` class: ONNX inference and streaming |
-| `zentts/tokenizer.py` | text normalisation, phonemization, token encoding |
-| `zentts/models.py` | finding, downloading and verifying the model files |
-| `zentts/config.py` | languages, vocabulary, file names, release URLs |
-| `zentts/log.py` | logger, controlled by `LOG_LEVEL` |
+| Configuration | languages, voice ids, vocabulary, file names, release URLs |
+| Logging | logger, controlled by `LOG_LEVEL` |
+| Tokenizer | text normalisation, phonemization, token encoding |
+| Engine | the `ZenTTS` class: ONNX inference and streaming |
+| Model files | finding, downloading and verifying the model files |
+| Command-line interface | argument parsing, EPUB/PDF reading, chunking, output |
 
 ## Code style
 
@@ -71,5 +73,9 @@ duplicates. For questions, use GitHub Discussions rather than the issue tracker.
 
 ## License
 
-By contributing you agree that your contributions are licensed under the
-project's [MIT License](LICENSE).
+ZenTTS is proprietary software, © 2026 Omor, all rights reserved. By submitting
+a contribution you assign copyright in it to the project owner, so that it can
+be distributed under the project's [LICENSE](LICENSE). If you are not willing
+to do that, please open an issue describing the change instead of sending code.
+
+Contact: https://www.linkedin.com/in/omardeveloper/

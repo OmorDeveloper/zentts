@@ -1,5 +1,7 @@
 # ZenTTS
 
+By [Omor](https://www.linkedin.com/in/omardeveloper/)
+
 English text-to-speech from your terminal. ZenTTS turns `.txt`, `.epub` and
 `.pdf` files into `.wav` or `.mp3` audio, with per-chapter splitting, voice
 blending and live streaming playback.
@@ -58,10 +60,12 @@ zentts input.txt out.wav --model ./zentts-v1.0.onnx --voices ./zentts-voices-v1.
 ## Usage
 
 ```bash
-zentts input.txt output.wav --speed 1.2 --lang en-us --voice af_sarah
+zentts input.txt output.wav --speed 1.2 --lang en-us --voice zen_us_f10
+zentts part1.txt part2.txt part3.txt book.wav
+zentts intro.txt chapters.epub notes.pdf audiobook.mp3 --format mp3
 zentts book.epub --split-output ./chunks/ --format mp3
-zentts paper.pdf output.wav --lang en-gb --voice bf_emma
-zentts input.txt --stream --voice "af_sarah:60,am_adam:40"
+zentts paper.pdf output.wav --lang en-gb --voice zen_uk_f02
+zentts input.txt --stream --voice "zen_us_f10:60,zen_us_m01:40"
 zentts --merge-chunks --split-output ./chunks/ --format wav
 zentts --help-voices
 zentts --help-languages
@@ -85,15 +89,34 @@ zentts --help
 
 ### Voices
 
-Voice names carry their accent and gender in the prefix: `af_` American female,
-`am_` American male, `bf_` British female, `bm_` British male. Run
-`zentts --help-voices` for the full list in your voice file.
+There are 28 ZenTTS voices. A voice id reads `zen_<region>_<gender><number>`:
+
+| Prefix | Voices | Use with |
+| --- | --- | --- |
+| `zen_us_f` | `zen_us_f01` … `zen_us_f11` | `--lang en-us` |
+| `zen_us_m` | `zen_us_m01` … `zen_us_m09` | `--lang en-us` |
+| `zen_uk_f` | `zen_uk_f01` … `zen_uk_f04` | `--lang en-gb` |
+| `zen_uk_m` | `zen_uk_m01` … `zen_uk_m04` | `--lang en-gb` |
+
+Run `zentts --help-voices` to list them grouped by region and gender.
 
 Blend two voices by weight:
 
 ```bash
-zentts input.txt out.wav --voice "af_sarah:60,am_adam:40"
-zentts input.txt out.wav --voice "am_adam,af_sarah"   # 50-50
+zentts input.txt out.wav --voice "zen_us_f10:60,zen_us_m01:40"
+zentts input.txt out.wav --voice "zen_us_m01,zen_us_f10"   # 50-50
+```
+
+## Multiple input files
+
+Pass as many inputs as you like and they are joined, in order, into one output
+file. Formats can be mixed. If the last argument ends in `.wav` or `.mp3` it is
+the output; otherwise the name is taken from the first input.
+
+```bash
+zentts ch1.txt ch2.txt ch3.txt book.wav
+zentts intro.txt body.epub appendix.pdf audiobook.mp3 --format mp3
+zentts ch1.txt ch2.txt --stream          # plays them back to back
 ```
 
 ### Long books
@@ -115,7 +138,7 @@ import soundfile as sf
 model, voices = resolve_model_files()   # downloads on first use
 engine = ZenTTS(model, voices)
 
-samples, sample_rate = engine.create("Hello from ZenTTS.", voice="af_sarah")
+samples, sample_rate = engine.create("Hello from ZenTTS.", voice="zen_us_f10")
 sf.write("hello.wav", samples, sample_rate)
 ```
 
@@ -127,5 +150,14 @@ Windows, macOS and Linux.
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Third-party components and the model weights are
-credited in [NOTICE.md](NOTICE.md).
+ZenTTS is proprietary software, © 2026 Omor, all rights reserved — see
+[LICENSE](LICENSE). You may use it, including commercially, but not
+redistribute or modify it without permission.
+
+Third-party components and the model weights it builds on keep their own
+licences, reproduced in [NOTICE.md](NOTICE.md).
+
+## Author
+
+Omor — [LinkedIn](https://www.linkedin.com/in/omardeveloper/) ·
+[GitHub](https://github.com/OmorDeveloper)

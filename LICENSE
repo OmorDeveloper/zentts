@@ -1,21 +1,64 @@
-MIT License
+ZenTTS Software License
 
-Copyright (c) 2026 Omor
+Copyright (c) 2026 Omor (https://www.linkedin.com/in/omardeveloper/)
+All rights reserved.
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+This software and its accompanying model files ("the Software") are the
+property of the copyright holder. This is not open-source software. It is
+licensed, not sold, on the terms below.
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+1. Grant of licence
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+   You are granted a personal, non-exclusive, non-transferable, revocable
+   licence to install and use the Software, including for commercial purposes,
+   on any number of machines you control.
+
+2. Restrictions
+
+   Without the prior written permission of the copyright holder, you may not:
+
+   a) redistribute, publish, sublicense, sell, rent, lease or lend the
+      Software or the model files, in whole or in part;
+   b) modify the Software, or create derivative works from it;
+   c) offer the Software to third parties as a hosted or managed service;
+   d) remove or alter any copyright, trademark or attribution notice,
+      including the third-party notices in NOTICE.md;
+   e) use the name "ZenTTS" or the author's name to endorse or promote any
+      product without permission.
+
+   Reverse engineering is permitted only to the extent that this restriction
+   cannot lawfully be excluded under applicable law.
+
+3. Ownership
+
+   The copyright holder retains all right, title and interest in the Software.
+   Nothing in this licence transfers ownership of any intellectual property.
+
+4. Third-party components
+
+   The Software incorporates and depends on third-party components that are
+   licensed separately by their own authors. Those components remain governed
+   by their own licences, which are reproduced in NOTICE.md. Nothing in this
+   licence limits any right you have under those licences with respect to
+   those components.
+
+5. No warranty
+
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+   FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+
+6. Limitation of liability
+
+   IN NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES OR
+   OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE,
+   ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+   DEALINGS IN THE SOFTWARE.
+
+7. Termination
+
+   This licence terminates automatically if you breach any of its terms. On
+   termination you must stop using the Software and delete all copies.
+
+For permissions beyond the scope of this licence, contact the author:
+https://www.linkedin.com/in/omardeveloper/

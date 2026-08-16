@@ -1,40 +1,749 @@
 #!/usr/bin/env python3
-"""Command-line interface for ZenTTS."""
+"""ZenTTS - English text-to-speech for the command line and for Python.
+
+Everything lives in this one module: configuration, the espeak-ng tokenizer,
+the ONNX engine, the model downloader and the CLI.
+"""
 
 # Standard library imports
+import asyncio
+import ctypes
+import ctypes.util
 import difflib
+import hashlib
 import importlib.metadata
+import importlib.util
 import itertools
+import logging
 import os
+import platform
 import re
 import signal
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 import warnings
+from collections.abc import AsyncGenerator
+from dataclasses import dataclass
+from pathlib import Path
 
 # Third-party imports
+import espeakng_loader
 import numpy as np
+import onnxruntime as rt
+import phonemizer
 import pymupdf
 import pymupdf4llm
 import sounddevice as sd
 import soundfile as sf
 from bs4 import BeautifulSoup
 from ebooklib import ITEM_DOCUMENT, epub
-
-# Local imports
-from .config import SUPPORTED_LANGUAGES, VOICE_PREFIXES
-from .engine import ZenTTS
-from .models import ensure_models, model_dir, resolve_model_files
+from numpy.typing import NDArray
+from phonemizer.backend.espeak.wrapper import EspeakWrapper
 
 warnings.filterwarnings("ignore", category=UserWarning, module="ebooklib")
 warnings.filterwarnings("ignore", category=FutureWarning, module="ebooklib")
+
+
+##############################################################################
+# Configuration
+##############################################################################
+
+SUPPORTED_LANGUAGES = ["en-us", "en-gb"]
+
+# Voice-name prefixes for the English voice packs. A ZenTTS voice id reads
+# zen_<region>_<gender><number>, e.g. zen_us_f10 or zen_uk_m03.
+VOICE_PREFIXES = ("zen_us_f", "zen_us_m", "zen_uk_f", "zen_uk_m")
+
+# Human-readable label for each voice-id prefix.
+VOICE_GROUPS = {
+    "zen_us_f": "US English, female",
+    "zen_us_m": "US English, male",
+    "zen_uk_f": "UK English, female",
+    "zen_uk_m": "UK English, male",
+}
+
+# Language each voice group was trained for, used to suggest --lang.
+VOICE_GROUP_LANGUAGE = {
+    "zen_us_f": "en-us",
+    "zen_us_m": "en-us",
+    "zen_uk_f": "en-gb",
+    "zen_uk_m": "en-gb",
+}
+
+# The ONNX graph is compiled for a fixed context length.
+MAX_PHONEME_LENGTH = 510
+
+# Output sample rate of the model, in Hz.
+SAMPLE_RATE = 24000
+
+# Model release the code is built against.
+MODEL_VERSION = "v1.0"
+MODEL_FILENAME = f"zentts-{MODEL_VERSION}.onnx"
+VOICES_FILENAME = f"zentts-voices-{MODEL_VERSION}.bin"
+
+# Where the model files are published.
+RELEASE_TAG = "v1.0.0"
+RELEASE_BASE_URL = (
+    f"https://github.com/OmorDeveloper/zentts/releases/download/{RELEASE_TAG}"
+)
+MODEL_URL = f"{RELEASE_BASE_URL}/{MODEL_FILENAME}"
+VOICES_URL = f"{RELEASE_BASE_URL}/{VOICES_FILENAME}"
+
+
+@dataclass
+class EspeakConfig:
+    """Override the bundled espeak-ng library/data locations."""
+
+    lib_path: str | None = None
+    data_path: str | None = None
+
+
+def _build_vocab() -> dict[str, int]:
+    """Symbol table shared by the model and the tokenizer."""
+    pad = "$"
+    punctuation = ';:,.!?¡¿—…"«»“” '
+    letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+    letters_ipa = (
+        "ɑɐɒæɓʙβɔɕçɗɖðʤəɘɚɛɜɝɞɟʄɡɠɢʛɦɧħɥʜɨɪʝɭɬɫɮʟɱɯɰŋɳɲɴøɵɸθœɶʘɹɺɾɻʀʁɽʂʃʈʧʉʊʋⱱʌɣɤʍχʎʏʑʐʒʔʡʕʢ"
+        "ǀǁǂǃˈˌːˑʼʴʰʱʲʷˠˤ˞↓↑→↗↘'̩'ᵻ"
+    )
+    symbols = [pad] + list(punctuation) + list(letters) + list(letters_ipa)
+    return {symbol: index for index, symbol in enumerate(symbols)}
+
+
+VOCAB = _build_vocab()
+
+
+##############################################################################
+# Logging
+##############################################################################
+
+def _create_logger() -> logging.Logger:
+    logger = logging.getLogger("zentts")
+    if not logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(
+            logging.Formatter("%(levelname)-8s [%(filename)s:%(lineno)d] %(message)s")
+        )
+        logger.addHandler(handler)
+    level = os.getenv("LOG_LEVEL", "WARNING").upper()
+    logger.setLevel(getattr(logging, level, logging.WARNING))
+    return logger
+
+
+log = _create_logger()
+
+
+##############################################################################
+# Tokenizer
+##############################################################################
+
+class Tokenizer:
+    """Turns English text into the phoneme token ids the model expects."""
+
+    def __init__(self, espeak_config: EspeakConfig | None = None):
+        if not espeak_config:
+            espeak_config = EspeakConfig()
+        if not espeak_config.data_path:
+            espeak_config.data_path = espeakng_loader.get_data_path()
+        if not espeak_config.lib_path:
+            espeak_config.lib_path = espeakng_loader.get_library_path()
+
+        # An explicit library path always wins over the bundled one.
+        if os.getenv("PHONEMIZER_ESPEAK_LIBRARY"):
+            espeak_config.lib_path = os.getenv("PHONEMIZER_ESPEAK_LIBRARY")
+
+        try:
+            ctypes.cdll.LoadLibrary(espeak_config.lib_path)
+        except Exception as e:
+            log.error(f"Failed to load the bundled espeak-ng library: {e}")
+            log.warning("Falling back to a system-wide espeak-ng install")
+
+            error_info = (
+                "Failed to load espeak-ng. Please install espeak-ng system wide.\n"
+                "\tSee https://github.com/espeak-ng/espeak-ng/blob/master/docs/guide.md\n"
+                "\tYou can also point ZenTTS at a library with the "
+                "PHONEMIZER_ESPEAK_LIBRARY environment variable.\n"
+                f"Environment:\n\t{platform.platform()} ({platform.release()}) | {sys.version}"
+            )
+            espeak_config.lib_path = ctypes.util.find_library(
+                "espeak-ng"
+            ) or ctypes.util.find_library("espeak")
+            if not espeak_config.lib_path:
+                raise RuntimeError(error_info)
+            try:
+                ctypes.cdll.LoadLibrary(espeak_config.lib_path)
+            except Exception as e:
+                raise RuntimeError(f"{e}: {error_info}")
+
+        EspeakWrapper.set_data_path(espeak_config.data_path)
+        EspeakWrapper.set_library(espeak_config.lib_path)
+
+    @staticmethod
+    def split_num(num):
+        """Read years and clock times the way a person would."""
+        num = num.group()
+        if "." in num:
+            return num
+        elif ":" in num:
+            h, m = [int(n) for n in num.split(":")]
+            if m == 0:
+                return f"{h} o'clock"
+            elif m < 10:
+                return f"{h} oh {m}"
+            return f"{h} {m}"
+        year = int(num[:4])
+        if year < 1100 or year % 1000 < 10:
+            return num
+        left, right = num[:2], int(num[2:4])
+        s = "s" if num.endswith("s") else ""
+        if 100 <= year % 1000 <= 999:
+            if right == 0:
+                return f"{left} hundred{s}"
+            elif right < 10:
+                return f"{left} oh {right}{s}"
+        return f"{left} {right}{s}"
+
+    @staticmethod
+    def flip_money(m):
+        """Turn "$4.50" into "4 dollars and 50 cents"."""
+        m = m.group()
+        bill = "dollar" if m[0] == "$" else "pound"
+        if m[-1].isalpha():
+            return f"{m[1:]} {bill}s"
+        elif "." not in m:
+            s = "" if m[1:] == "1" else "s"
+            return f"{m[1:]} {bill}{s}"
+        b, c = m[1:].split(".")
+        s = "" if b == "1" else "s"
+        c = int(c.ljust(2, "0"))
+        coins = (
+            f"cent{'' if c == 1 else 's'}"
+            if m[0] == "$"
+            else ("penny" if c == 1 else "pence")
+        )
+        return f"{b} {bill}{s} and {c} {coins}"
+
+    @staticmethod
+    def point_num(num) -> str:
+        a, b = num.group().split(".")
+        return " point ".join([a, " ".join(b)])
+
+    @staticmethod
+    def normalize_text(text) -> str:
+        """Clean up punctuation, numbers and abbreviations before phonemizing."""
+        # strip whitespace and drop empty lines
+        text = "\n".join(line.strip() for line in text.splitlines() if line.strip())
+        # curly quotes to straight quotes
+        text = text.replace(chr(8216), "'").replace(chr(8217), "'")
+        text = text.replace("«", chr(8220)).replace("»", chr(8221))
+        text = text.replace(chr(8220), '"').replace(chr(8221), '"')
+        # parentheses read as quoted asides
+        text = text.replace("(", "«").replace(")", "»")
+        for a, b in zip("、。！，：；？", ",.!,:;?"):
+            text = text.replace(a, b + " ")
+        text = re.sub(r"[^\S \n]", " ", text)
+        text = re.sub(r"  +", " ", text)
+        text = re.sub(r"(?<=\n) +(?=\n)", "", text)
+        text = re.sub(r"\bD[Rr]\.(?= [A-Z])", "Doctor", text)
+        text = re.sub(r"\b(?:Mr\.|MR\.(?= [A-Z]))", "Mister", text)
+        text = re.sub(r"\b(?:Ms\.|MS\.(?= [A-Z]))", "Miss", text)
+        text = re.sub(r"\b(?:Mrs\.|MRS\.(?= [A-Z]))", "Mrs", text)
+        text = re.sub(r"\betc\.(?! [A-Z])", "etc", text)
+        text = re.sub(r"(?i)\b(y)eah?\b", r"\1e'a", text)
+        text = re.sub(
+            r"\d*\.\d+|\b\d{4}s?\b|(?<!:)\b(?:[1-9]|1[0-2]):[0-5]\d\b(?!:)",
+            Tokenizer.split_num,
+            text,
+        )
+        text = re.sub(r"(?<=\d),(?=\d)", "", text)
+        text = re.sub(
+            r"(?i)[$£]\d+(?:\.\d+)?(?: hundred| thousand| (?:[bm]|tr)illion)*\b|[$£]\d+\.\d\d?\b",
+            Tokenizer.flip_money,
+            text,
+        )
+        text = re.sub(r"\d*\.\d+", Tokenizer.point_num, text)
+        text = re.sub(r"(?<=\d)-(?=\d)", " to ", text)
+        text = re.sub(r"(?<=\d)S", " S", text)
+        text = re.sub(r"(?<=[BCDFGHJ-NP-TV-Z])'?s\b", "'S", text)
+        text = re.sub(r"(?<=X')S\b", "s", text)
+        text = re.sub(
+            r"(?:[A-Za-z]\.){2,} [a-z]", lambda m: m.group().replace(".", "-"), text
+        )
+        text = re.sub(r"(?i)(?<=[A-Z])\.(?=[A-Z])", "-", text)
+        return text.strip()
+
+    def tokenize(self, phonemes: str) -> list[int]:
+        if len(phonemes) > MAX_PHONEME_LENGTH:
+            raise ValueError(
+                f"text is too long, must be less than {MAX_PHONEME_LENGTH} phonemes"
+            )
+        return [i for i in map(VOCAB.get, phonemes) if i is not None]
+
+    def phonemize(self, text: str, lang: str = "en-us", norm: bool = True) -> str:
+        """Phonemize English text. `lang` is either 'en-us' or 'en-gb'."""
+        if norm:
+            text = Tokenizer.normalize_text(text)
+
+        phonemes = phonemizer.phonemize(
+            text, lang, preserve_punctuation=True, with_stress=True
+        )
+
+        # espeak emits a few symbols the model was not trained on.
+        phonemes = (
+            phonemes.replace("ʲ", "j")
+            .replace("r", "ɹ")
+            .replace("x", "k")
+            .replace("ɬ", "l")
+        )
+        phonemes = re.sub(r"(?<=[a-zɹː])(?=hˈʌndɹɪd)", " ", phonemes)
+        phonemes = re.sub(r' z(?=[;:,.!?¡¿—…"«»“” ]|$)', "z", phonemes)
+        if lang == "en-us":
+            phonemes = re.sub(r"(?<=nˈaɪn)ti(?!ː)", "di", phonemes)
+        phonemes = "".join(filter(lambda p: p in VOCAB, phonemes))
+        return phonemes.strip()
+
+
+##############################################################################
+# Engine
+##############################################################################
+
+def trim_silence(
+    audio: NDArray[np.float32],
+    top_db: float = 60.0,
+    frame_length: int = 2048,
+    hop_length: int = 512,
+) -> NDArray[np.float32]:
+    """Drop leading/trailing silence so concatenated chunks flow naturally.
+
+    Frames the signal, compares each frame's RMS against the loudest frame and
+    keeps everything within `top_db` of it.
+    """
+    if audio.size == 0:
+        return audio
+
+    padded = np.pad(audio.astype(np.float32), frame_length // 2)
+    frame_count = 1 + (len(padded) - frame_length) // hop_length
+    if frame_count < 1:
+        return audio
+
+    frames = np.lib.stride_tricks.sliding_window_view(padded, frame_length)
+    frames = frames[:: hop_length][:frame_count]
+    rms = np.sqrt(np.mean(np.square(frames, dtype=np.float64), axis=1))
+
+    loudest = rms.max()
+    if loudest <= 0:
+        return audio
+
+    db = 20.0 * np.log10(np.maximum(rms, 1e-10) / loudest)
+    voiced = np.flatnonzero(db > -top_db)
+    if voiced.size == 0:
+        return audio
+
+    start = min(len(audio), int(voiced[0]) * hop_length)
+    end = min(len(audio), int(voiced[-1] + 1) * hop_length)
+    return audio[start:end]
+
+
+class ZenTTS:
+    """Loads a ZenTTS ONNX model plus its voice pack and synthesises speech."""
+
+    def __init__(
+        self,
+        model_path: str,
+        voices_path: str,
+        espeak_config: EspeakConfig | None = None,
+    ):
+        for label, path in (("Model", model_path), ("Voices", voices_path)):
+            if not Path(path).exists():
+                raise FileNotFoundError(f"{label} file not found at {path}")
+
+        # See https://github.com/microsoft/onnxruntime/issues/22101 for provider notes.
+        providers = ["CPUExecutionProvider"]
+        if importlib.util.find_spec("onnxruntime-gpu"):
+            providers = rt.get_available_providers()
+        if os.getenv("ONNX_PROVIDER"):
+            providers = [os.environ["ONNX_PROVIDER"]]
+
+        log.debug(f"Providers: {providers}")
+        self.model_path = model_path
+        self.voices_path = voices_path
+        self.sess = rt.InferenceSession(model_path, providers=providers)
+        self.voices: np.ndarray = np.load(voices_path)
+        self.tokenizer = Tokenizer(espeak_config)
+
+    @classmethod
+    def from_session(
+        cls,
+        session: rt.InferenceSession,
+        voices_path: str,
+        espeak_config: EspeakConfig | None = None,
+    ) -> "ZenTTS":
+        """Build an engine around an already-created ONNX session."""
+        instance = cls.__new__(cls)
+        instance.sess = session
+        instance.model_path = getattr(session, "_model_path", "<session>")
+        instance.voices_path = voices_path
+        instance.voices = np.load(voices_path)
+        instance.tokenizer = Tokenizer(espeak_config)
+        return instance
+
+    def get_voices(self) -> list[str]:
+        """The English voices in the loaded voice pack."""
+        return sorted(v for v in self.voices.keys() if v.startswith(VOICE_PREFIXES))
+
+    def get_languages(self) -> list[str]:
+        return list(SUPPORTED_LANGUAGES)
+
+    def get_voice_style(self, name: str) -> NDArray[np.float32]:
+        if name not in self.get_voices():
+            raise ValueError(f"Voice {name} is not an available English voice")
+        return self.voices[name]
+
+    def _create_audio(
+        self, phonemes: str, voice: NDArray[np.float32], speed: float
+    ) -> tuple[NDArray[np.float32], int]:
+        log.debug(f"Phonemes: {phonemes}")
+        if len(phonemes) > MAX_PHONEME_LENGTH:
+            log.warning(f"Phonemes too long, truncating to {MAX_PHONEME_LENGTH}")
+        phonemes = phonemes[:MAX_PHONEME_LENGTH]
+
+        start_t = time.time()
+        tokens = self.tokenizer.tokenize(phonemes)
+        assert len(tokens) <= MAX_PHONEME_LENGTH, (
+            f"Context length is {MAX_PHONEME_LENGTH}, leaving room for the pad "
+            "token 0 at the start and end"
+        )
+
+        style = voice[len(tokens)]
+        tokens = [[0, *tokens, 0]]
+
+        audio = self.sess.run(
+            None,
+            dict(
+                tokens=tokens, style=style, speed=np.ones(1, dtype=np.float32) * speed
+            ),
+        )[0]
+
+        audio_duration = len(audio) / SAMPLE_RATE
+        create_duration = time.time() - start_t
+        rtf = create_duration / audio_duration if audio_duration else 0.0
+        log.debug(
+            f"Created {audio_duration:.2f}s of audio from {len(phonemes)} phonemes "
+            f"in {create_duration:.2f}s (RTF: {rtf:.2f})"
+        )
+        return audio, SAMPLE_RATE
+
+    def _split_phonemes(self, phonemes: str) -> list[str]:
+        """Split phonemes into model-sized batches, preferring punctuation breaks."""
+        parts = re.split(r"([.,!?;])", phonemes)
+        batches: list[str] = []
+        current = ""
+
+        for part in parts:
+            part = part.strip()
+            if not part:
+                continue
+            if len(current) + len(part) + 1 > MAX_PHONEME_LENGTH:
+                batches.append(current.strip())
+                current = part
+            elif part in ".,!?;":
+                current += part
+            else:
+                if current:
+                    current += " "
+                current += part
+
+        if current:
+            batches.append(current.strip())
+
+        return batches
+
+    def _resolve_voice(
+        self, voice: str | NDArray[np.float32]
+    ) -> NDArray[np.float32]:
+        if isinstance(voice, str):
+            return self.get_voice_style(voice)
+        return voice
+
+    @staticmethod
+    def _validate(lang: str, speed: float) -> None:
+        if lang not in SUPPORTED_LANGUAGES:
+            raise ValueError(
+                f"Language must be one of {', '.join(SUPPORTED_LANGUAGES)}. Got {lang}"
+            )
+        if not 0.5 <= speed <= 2.0:
+            raise ValueError("Speed should be between 0.5 and 2.0")
+
+    def create(
+        self,
+        text: str,
+        voice: str | NDArray[np.float32],
+        speed: float = 1.0,
+        lang: str = "en-us",
+        phonemes: str | None = None,
+        trim: bool = True,
+    ) -> tuple[NDArray[np.float32], int]:
+        """Synthesise `text` with the given voice and speed."""
+        self._validate(lang, speed)
+        style = self._resolve_voice(voice)
+
+        start_t = time.time()
+        if not phonemes:
+            phonemes = self.tokenizer.phonemize(text, lang)
+        batches = self._split_phonemes(phonemes)
+
+        log.debug(f"Creating audio for {len(batches)} batches, {len(phonemes)} phonemes")
+        audio = []
+        for batch in batches:
+            part, _ = self._create_audio(batch, style, speed)
+            if trim:
+                part = trim_silence(part)
+            audio.append(part)
+
+        merged = np.concatenate(audio) if audio else np.zeros(0, dtype=np.float32)
+        log.debug(f"Created audio in {time.time() - start_t:.2f}s")
+        return merged, SAMPLE_RATE
+
+    async def create_stream(
+        self,
+        text: str,
+        voice: str | NDArray[np.float32],
+        speed: float = 1.0,
+        lang: str = "en-us",
+        phonemes: str | None = None,
+        trim: bool = True,
+    ) -> AsyncGenerator[tuple[NDArray[np.float32], int], None]:
+        """Yield audio chunks as they finish, so playback can start early."""
+        self._validate(lang, speed)
+        style = self._resolve_voice(voice)
+
+        if not phonemes:
+            phonemes = self.tokenizer.phonemize(text, lang)
+        batches = self._split_phonemes(phonemes)
+        queue: asyncio.Queue[tuple[NDArray[np.float32], int] | None] = asyncio.Queue()
+
+        async def process_batches():
+            for i, batch in enumerate(batches):
+                loop = asyncio.get_event_loop()
+                # Inference blocks, so keep it off the event loop.
+                part, sample_rate = await loop.run_in_executor(
+                    None, self._create_audio, batch, style, speed
+                )
+                if trim:
+                    part = trim_silence(part)
+                log.debug(f"Processed chunk {i} of stream")
+                await queue.put((part, sample_rate))
+            await queue.put(None)
+
+        task = asyncio.create_task(process_batches())
+        try:
+            while True:
+                chunk = await queue.get()
+                if chunk is None:
+                    break
+                yield chunk
+        finally:
+            if not task.done():
+                task.cancel()
+
+
+##############################################################################
+# Model files
+##############################################################################
+
+CHECKSUMS = {
+    MODEL_FILENAME: "7d5df8ecf7d4b1878015a32686053fd0eebe2bc377234608764cc0ef3636a6c5",
+    VOICES_FILENAME: "37fd54100503ac57f5ad27fdc128bba191d1da6203e7a44949fb27198ad0388e",
+}
+
+DOWNLOAD_URLS = {
+    MODEL_FILENAME: MODEL_URL,
+    VOICES_FILENAME: VOICES_URL,
+}
+
+
+def model_dir() -> Path:
+    """Directory the downloaded model files live in.
+
+    Override it with ZENTTS_HOME; otherwise use the per-user cache directory.
+    """
+    env_home = os.getenv("ZENTTS_HOME")
+    if env_home:
+        return Path(env_home).expanduser()
+    if sys.platform == "win32":
+        base = os.getenv("LOCALAPPDATA") or Path.home() / "AppData" / "Local"
+        return Path(base) / "zentts"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Caches" / "zentts"
+    base = os.getenv("XDG_CACHE_HOME") or Path.home() / ".cache"
+    return Path(base) / "zentts"
+
+
+def _human(size: float) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{size:.1f}{unit}"
+        size /= 1024
+    return f"{size:.1f}GB"
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for block in iter(lambda: fh.read(1 << 22), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def download_file(url: str, destination: Path, quiet: bool = False) -> Path:
+    """Download `url` to `destination`, showing progress and verifying the hash."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    partial = destination.with_suffix(destination.suffix + ".part")
+
+    if not quiet:
+        print(f"Downloading {destination.name}")
+        print(f"  from {url}")
+
+    request = urllib.request.Request(url, headers={"User-Agent": "zentts"})
+    started = time.time()
+    try:
+        with urllib.request.urlopen(request) as response:
+            total = int(response.headers.get("Content-Length") or 0)
+            downloaded = 0
+            with open(partial, "wb") as out:
+                while True:
+                    block = response.read(1 << 20)
+                    if not block:
+                        break
+                    out.write(block)
+                    downloaded += len(block)
+                    if quiet:
+                        continue
+                    if total:
+                        done = int(30 * downloaded / total)
+                        bar = "■" * done + "□" * (30 - done)
+                        percent = 100 * downloaded / total
+                        sys.stdout.write(
+                            f"\r  [{bar}] {percent:5.1f}% "
+                            f"({_human(downloaded)} / {_human(total)})"
+                        )
+                    else:
+                        sys.stdout.write(f"\r  {_human(downloaded)} downloaded")
+                    sys.stdout.flush()
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError) as e:
+        partial.unlink(missing_ok=True)
+        raise RuntimeError(f"Download failed for {url}: {e}") from e
+
+    if not quiet:
+        sys.stdout.write(f"\n  finished in {time.time() - started:.1f}s\n")
+
+    expected = CHECKSUMS.get(destination.name)
+    if expected:
+        if not quiet:
+            print("  verifying checksum...")
+        actual = _sha256(partial)
+        if actual != expected:
+            partial.unlink(missing_ok=True)
+            raise RuntimeError(
+                f"Checksum mismatch for {destination.name}\n"
+                f"  expected {expected}\n  got      {actual}"
+            )
+
+    partial.replace(destination)
+    return destination
+
+
+def _find_existing(filename: str) -> Path | None:
+    """Look for a model file in the working directory, then the cache."""
+    for candidate in (Path.cwd() / filename, model_dir() / filename):
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def resolve_file(
+    filename: str, explicit_path: str | None = None, allow_download: bool = True
+) -> Path:
+    """Return a usable path for a model file, downloading it if needed."""
+    if explicit_path:
+        path = Path(explicit_path).expanduser()
+        if not path.exists():
+            raise FileNotFoundError(f"File not found: {path}")
+        return path
+
+    existing = _find_existing(filename)
+    if existing:
+        return existing
+
+    url = DOWNLOAD_URLS.get(filename)
+    if not allow_download or not url:
+        raise FileNotFoundError(
+            f"{filename} not found in {Path.cwd()} or {model_dir()}.\n"
+            f"Download it from {url or 'the project release page'} "
+            "or pass --model / --voices."
+        )
+
+    return download_file(url, model_dir() / filename)
+
+
+def resolve_model_files(
+    model_path: str | None = None,
+    voices_path: str | None = None,
+    allow_download: bool = True,
+) -> tuple[str, str]:
+    """Resolve both model files, returning their paths as strings."""
+    if os.getenv("ZENTTS_NO_DOWNLOAD"):
+        allow_download = False
+
+    model = resolve_file(MODEL_FILENAME, model_path, allow_download)
+    voices = resolve_file(VOICES_FILENAME, voices_path, allow_download)
+    return str(model), str(voices)
+
+
+def ensure_models(quiet: bool = False) -> tuple[Path, Path]:
+    """Fetch both model files, replacing any local copy that is out of date.
+
+    An existing file is checked against its published sha256, so an older or
+    partly written copy is downloaded again instead of being trusted.
+    """
+    paths = []
+    for filename in (MODEL_FILENAME, VOICES_FILENAME):
+        existing = _find_existing(filename)
+        expected = CHECKSUMS.get(filename)
+
+        if existing and expected:
+            if not quiet:
+                print(f"Checking {existing}...")
+            if _sha256(existing) == expected:
+                if not quiet:
+                    print(f"  {filename} is up to date")
+                paths.append(existing)
+                continue
+            print(f"  {filename} does not match the published file, replacing it")
+        elif existing:
+            paths.append(existing)
+            continue
+
+        target = existing if existing else model_dir() / filename
+        paths.append(download_file(DOWNLOAD_URLS[filename], target, quiet))
+
+    return paths[0], paths[1]
+
+
+##############################################################################
+# Command-line interface
+##############################################################################
+
 
 # Global flags to stop the spinner and audio
 stop_spinner = False
 stop_audio = False
 
-DEFAULT_VOICE = "af_sarah"
+DEFAULT_VOICE = "zen_us_f10"
 
 
 def _filter_english_voices(voices):
@@ -56,10 +765,19 @@ def load_engine(model_path=None, voices_path=None):
         sys.exit(1)
 
     try:
-        return ZenTTS(model, voices)
+        engine = ZenTTS(model, voices)
     except Exception as e:
         print(f"Error loading the ZenTTS model: {e}")
         sys.exit(1)
+
+    if not engine.get_voices():
+        print(
+            f"Error: {voices} contains no ZenTTS voices, so it is probably an "
+            "older voice pack.\nRun `zentts --download` to replace it."
+        )
+        sys.exit(1)
+
+    return engine
 
 
 def spinning_wheel(message="Processing...", progress=None):
@@ -77,11 +795,34 @@ def spinning_wheel(message="Processing...", progress=None):
     sys.stdout.flush()
 
 
-def list_available_voices(engine):
+def voice_label(voice):
+    """Describe a voice id, e.g. zen_uk_m03 -> 'UK English, male'."""
+    for prefix, label in VOICE_GROUPS.items():
+        if voice.startswith(prefix):
+            return label
+    return "English"
+
+
+def list_available_voices(engine, numbered=True):
+    """Print the voices grouped by region and gender, and return them in order."""
     voices = _filter_english_voices(engine.get_voices())
-    print("Available voices (English only):")
-    for idx, voice in enumerate(voices):
-        print(f"{idx + 1}. {voice}")
+    if not voices:
+        print(
+            "Error: the voice file contains no ZenTTS voices. It is probably an "
+            "older voice pack.\nRun `zentts --download` to fetch the current one."
+        )
+        sys.exit(1)
+
+    index = 0
+    for prefix, label in VOICE_GROUPS.items():
+        group = [v for v in voices if v.startswith(prefix)]
+        if not group:
+            continue
+        print(f"\n{label} (use --lang {VOICE_GROUP_LANGUAGE[prefix]}):")
+        for voice in group:
+            index += 1
+            print(f"  {index:>2}. {voice}" if numbered else f"  {voice}")
+    print()
     return voices
 
 
@@ -159,7 +900,7 @@ def print_usage():
     print("""
 ZenTTS - English text-to-speech from the command line
 
-Usage: zentts <input_text_file> [<output_audio_file>] [options]
+Usage: zentts <input_file> [<more_input_files>...] [<output_audio_file>] [options]
 
 Commands:
     -h, --help         Show this help message
@@ -185,19 +926,27 @@ Input formats:
     .epub              EPUB book input (will process chapters)
     .pdf               PDF document input (extracts chapters from TOC or content)
 
+Multiple inputs:
+    Pass as many input files as you like and they are joined, in the order you
+    give them, into one output file. Formats can be mixed. If the last argument
+    ends in .wav or .mp3 it is the output file, otherwise the name is derived
+    from the first input.
+
 Model files:
     On first run ZenTTS downloads the model files automatically and caches them in
     {cache}. Set ZENTTS_HOME to change that location, or ZENTTS_NO_DOWNLOAD=1 to
     disable downloading.
 
 Examples:
-    zentts input.txt output.wav --speed 1.2 --lang en-us --voice af_sarah
+    zentts input.txt output.wav --speed 1.2 --lang en-us --voice zen_us_f10
+    zentts part1.txt part2.txt part3.txt book.wav
+    zentts intro.txt chapters.epub notes.pdf audiobook.mp3 --format mp3
     zentts input.epub --split-output ./chunks/ --format mp3
-    zentts input.pdf output.wav --speed 1.2 --lang en-gb --voice bf_emma
+    zentts input.pdf output.wav --speed 1.2 --lang en-gb --voice zen_uk_f02
     zentts input.pdf --split-output ./chunks/ --format mp3
     zentts input.txt --stream --speed 0.8
-    zentts input.txt output.wav --voice "af_sarah:60,am_adam:40"
-    zentts input.txt --stream --voice "am_adam,af_sarah" # 50-50 blend
+    zentts input.txt output.wav --voice "zen_us_f10:60,zen_us_m01:40"
+    zentts input.txt --stream --voice "zen_us_m01,zen_us_f10" # 50-50 blend
     zentts --merge-chunks --split-output ./chunks/ --format wav
     zentts --help-voices
     zentts --help-languages
@@ -216,19 +965,18 @@ def print_supported_languages(model_path=None, voices_path=None):
 
 
 def print_supported_voices(model_path=None, voices_path=None):
-    """Print all supported (English) voices."""
+    """Print all supported (English) voices, grouped by region and gender."""
     engine = load_engine(model_path, voices_path)
-    print("\nSupported voices:")
-    for idx, voice in enumerate(_filter_english_voices(engine.get_voices())):
-        print(f"    {idx + 1}. {voice}")
-    print()
+    print("\nZenTTS voices:")
+    list_available_voices(engine, numbered=False)
+    print('Blend any two with --voice "zen_us_f10:60,zen_us_m01:40"\n')
 
 
 def validate_voice(voice, engine):
     """Validate a voice name (English only) and handle voice blending.
 
     Format for blended voices: "voice1:weight,voice2:weight"
-    Example: "af_sarah:60,am_adam:40" for a 60-40 blend
+    Example: "zen_us_f10:60,zen_us_m01:40" for a 60-40 blend
     """
     supported_voices = set(_filter_english_voices(engine.get_voices()))
 
@@ -828,8 +1576,41 @@ def process_chunk_sequential(
         return None, None
 
 
+def load_chapters(input_file, debug=False, stdin_indicators=None):
+    """Read one input file and return its chapters.
+
+    A `.txt` file is a single chapter titled after the file; EPUB and PDF are
+    split into their own chapters.
+    """
+    if stdin_indicators is None:
+        stdin_indicators = ["/dev/stdin", "-", "CONIN$"]
+
+    if input_file.endswith(".epub"):
+        chapters = extract_chapters_from_epub(input_file, debug)
+        if not chapters:
+            print(f"No chapters found in {input_file}.")
+        return chapters
+
+    if input_file.endswith(".pdf"):
+        return PdfParser(input_file, debug=debug).get_chapters()
+
+    if input_file in stdin_indicators:
+        text = sys.stdin.read()
+        title = "Chapter 1"
+    else:
+        with open(input_file, "r", encoding="utf-8") as file:
+            text = file.read()
+        title = os.path.splitext(os.path.basename(input_file))[0] or "Chapter 1"
+
+    if not text.strip():
+        print(f"Warning: {input_file} is empty, skipping")
+        return []
+
+    return [{"title": title, "content": text, "order": 1}]
+
+
 def convert_text_to_audio(
-    input_file,
+    input_files,
     output_file=None,
     voice=None,
     speed=1.0,
@@ -854,8 +1635,10 @@ def convert_text_to_audio(
     if voice:
         voice = validate_voice(voice, engine)
     else:
-        if input_file in stdin_indicators:
-            print(f"Using stdin - automatically selecting default voice ({DEFAULT_VOICE})")
+        if any(f in stdin_indicators for f in input_files):
+            print(
+                f"Using stdin - automatically selecting default voice ({DEFAULT_VOICE})"
+            )
             voice = DEFAULT_VOICE
         else:
             voices = list_available_voices(engine)
@@ -897,24 +1680,48 @@ def convert_text_to_audio(
                 print("Invalid choice. Using default voice.")
                 voice = DEFAULT_VOICE
 
-    if input_file.endswith(".epub"):
-        chapters = extract_chapters_from_epub(input_file, debug)
-        if not chapters:
-            print("No chapters found in EPUB file.")
-            sys.exit(1)
+    chapters = []
+    needs_confirmation = False
 
+    for input_file in input_files:
+        if len(input_files) > 1:
+            print(f"\nReading: {input_file}")
+
+        chapters.extend(load_chapters(input_file, debug, stdin_indicators))
+
+        if input_file.endswith(".epub"):
+            needs_confirmation = True
+
+    if not chapters:
+        print("No text found to convert.")
+        sys.exit(1)
+
+    # Number the chapters across every input so a combined run stays in order.
+    for order, chapter in enumerate(chapters, 1):
+        chapter["order"] = order
+
+    if len(input_files) > 1:
+        total_words = sum(len(c["content"].split()) for c in chapters)
+        print(
+            f"\nCombining {len(input_files)} files into "
+            f"{len(chapters)} chapter(s), {total_words:,} words "
+            f"(about {total_words / 150:.1f} minutes)"
+        )
+
+    if needs_confirmation:
         print("\nPress Enter to start processing, or Ctrl+C to cancel...")
         input()
 
-        if split_output:
-            os.makedirs(split_output, exist_ok=True)
+    if split_output:
+        os.makedirs(split_output, exist_ok=True)
 
-            print("\nCreating chapter directories and info files...")
-            for chapter_num, chapter in enumerate(chapters, 1):
-                chapter_dir = os.path.join(split_output, f"chapter_{chapter_num:03d}")
-                os.makedirs(chapter_dir, exist_ok=True)
+        print("\nCreating chapter directories and info files...")
+        for chapter_num, chapter in enumerate(chapters, 1):
+            chapter_dir = os.path.join(split_output, f"chapter_{chapter_num:03d}")
+            os.makedirs(chapter_dir, exist_ok=True)
 
-                info_file = os.path.join(chapter_dir, "info.txt")
+            info_file = os.path.join(chapter_dir, "info.txt")
+            if not os.path.exists(info_file):
                 with open(info_file, "w", encoding="utf-8") as f:
                     f.write(f"Title: {chapter['title']}\n")
                     f.write(f"Order: {chapter['order']}\n")
@@ -923,18 +1730,7 @@ def convert_text_to_audio(
                         f"Estimated Duration: {len(chapter['content'].split()) / 150:.1f} minutes\n"
                     )
 
-            print("Created chapter directories and info files")
-
-    elif input_file.endswith(".pdf"):
-        parser = PdfParser(input_file, debug=debug)
-        chapters = parser.get_chapters()
-    else:
-        if input_file in stdin_indicators:
-            text = sys.stdin.read()
-        else:
-            with open(input_file, "r", encoding="utf-8") as file:
-                text = file.read()
-        chapters = [{"title": "Chapter 1", "content": text}]
+        print("Created chapter directories and info files")
 
     if stream:
         import asyncio
@@ -969,7 +1765,7 @@ def convert_text_to_audio(
                                 f"\nSkipping {chapter['title']}: Already completed ({existing_chunks} chunks)"
                             )
                             continue
-                        else:
+                        elif existing_chunks:
                             print(
                                 f"\nResuming {chapter['title']}: Found {existing_chunks}/{total_chunks} chunks"
                             )
@@ -1094,7 +1890,7 @@ def convert_text_to_audio(
             if all_samples:
                 print("\nSaving complete audio file...")
                 if not output_file:
-                    output_file = f"{os.path.splitext(input_file)[0]}.{format}"
+                    output_file = f"{os.path.splitext(input_files[0])[0]}.{format}"
                 sf.write(output_file, all_samples, sample_rate)
                 print(f"Created {output_file}")
 
@@ -1279,6 +2075,55 @@ def get_valid_options():
     }
 
 
+def split_positionals(argv, format="wav"):
+    """Separate the input files from an optional output file.
+
+    Everything that is not an option or an option's value is positional. If the
+    last positional looks like an audio file it is the output, and the rest are
+    inputs to be joined together:
+
+        zentts part1.txt part2.txt book.wav   -> 2 inputs, 1 output
+        zentts part1.txt part2.txt            -> 2 inputs, output derived
+    """
+    takes_value = {
+        "--speed",
+        "--lang",
+        "--voice",
+        "--split-output",
+        "--format",
+        "--model",
+        "--voices",
+    }
+    audio_suffixes = (".wav", ".mp3")
+
+    positionals = []
+    skip = False
+    for arg in argv:
+        if skip:
+            skip = False
+            continue
+        if arg in takes_value:
+            skip = True
+            continue
+        if arg.startswith("-") and arg not in ("-",):
+            continue
+        positionals.append(arg)
+
+    if not positionals:
+        return [], None
+
+    last = positionals[-1]
+    is_output = last.lower().endswith(audio_suffixes) and (
+        len(positionals) > 1 or last.lower().endswith("." + format)
+    )
+    if is_output and len(positionals) > 1:
+        return positionals[:-1], last
+    if is_output:
+        # A lone audio file is not a valid input, so treat it as the output.
+        return [], last
+    return positionals, None
+
+
 def _read_model_options(argv):
     """Pull --model / --voices out of the arguments, if present."""
     model_path = None
@@ -1350,17 +2195,6 @@ def main():
         print_supported_voices(*_read_model_options(sys.argv))
         sys.exit(0)
 
-    input_file = None
-    if len(sys.argv) > 1 and not sys.argv[1].startswith("--"):
-        input_file = sys.argv[1]
-        output_file = (
-            sys.argv[2]
-            if len(sys.argv) > 2 and not sys.argv[2].startswith("--")
-            else None
-        )
-    else:
-        output_file = None
-
     stream = "--stream" in sys.argv
     speed = 1.0
     lang = "en-us"
@@ -1392,6 +2226,8 @@ def main():
                 print("Error: Format must be either 'wav' or 'mp3'")
                 sys.exit(1)
 
+    input_files, output_file = split_positionals(sys.argv[1:], format)
+
     if merge_chunks:
         if not split_output:
             print(
@@ -1401,16 +2237,18 @@ def main():
         merge_chunks_to_chapters(split_output, format)
         sys.exit(0)
 
-    if not input_file:
+    if not input_files:
         print("Error: Input file required for text-to-speech conversion")
         print_usage()
         sys.exit(1)
 
-    if input_file not in stdin_indicators and not os.access(input_file, os.R_OK):
-        print(
-            f"Error: Cannot read from {input_file}. File may not exist or you may not have permission to read it."
-        )
-        sys.exit(1)
+    for path in input_files:
+        if path not in stdin_indicators and not os.access(path, os.R_OK):
+            print(
+                f"Error: Cannot read from {path}. File may not exist or you may not "
+                "have permission to read it."
+            )
+            sys.exit(1)
 
     if output_file and not output_file.endswith("." + format):
         print(f"Error: Output file must have .{format} extension.")
@@ -1419,7 +2257,7 @@ def main():
     debug = "--debug" in sys.argv
 
     convert_text_to_audio(
-        input_file,
+        input_files,
         output_file,
         voice=voice,
         stream=stream,
@@ -1436,3 +2274,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

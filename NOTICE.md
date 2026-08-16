@@ -1,12 +1,13 @@
 # Third-party notices
 
-ZenTTS is MIT licensed (see [LICENSE](LICENSE)). It builds on the open-source
-work listed below, which keeps its own license. These notices are required by
-those licenses and must stay with the project.
+ZenTTS itself is proprietary software (see [LICENSE](LICENSE)). It builds on the
+open-source work listed below, which keeps its own licence. These notices are
+required by those licences and must stay with the project, whatever licence
+ZenTTS is distributed under.
 
 ## Inference code
 
-`zentts/engine.py`, `zentts/tokenizer.py` and `zentts/config.py` are derived
+The engine, tokenizer and configuration sections of `zentts.py` are derived
 from the `kokoro-onnx` project by thewh1teagle, licensed MIT.
 
 - Project: https://github.com/thewh1teagle/kokoro-onnx
@@ -40,7 +41,9 @@ SOFTWARE.
 
 The `zentts-v1.0.onnx` model and the `zentts-voices-v1.0.bin` voice packs are
 redistributions of the Kokoro TTS model weights by hexgrad, licensed
-Apache-2.0. The files are renamed for this project; the weights are unmodified.
+Apache-2.0. The files and the voice ids inside them are renamed for this
+project, and the non-English voices are removed; the weights are unmodified.
+Apache-2.0 permits this, provided this notice is kept.
 
 - Project: https://huggingface.co/hexgrad/Kokoro-82M
 - License: Apache-2.0
@@ -53,6 +56,18 @@ Installed by pip, not vendored here: `onnxruntime` (MIT), `phonemizer-fork`
 `PyMuPDF` (AGPL-3.0 or commercial), `EbookLib` (AGPL-3.0),
 `beautifulsoup4` (MIT).
 
-Note that espeak-ng/phonemizer are GPL-3.0 and PyMuPDF/EbookLib are AGPL-3.0.
-That does not affect using ZenTTS, but it does constrain how a combined
-distribution may be relicensed.
+### Copyleft dependencies — read this before distributing
+
+`phonemizer-fork` and `espeakng-loader` (with the espeak-ng data) are GPL-3.0,
+and `PyMuPDF` and `EbookLib` are AGPL-3.0. Using ZenTTS yourself is unaffected.
+Distributing a proprietary ZenTTS that is combined with those libraries is not:
+GPL-3.0 and AGPL-3.0 both attach their terms to a combined work.
+
+If ZenTTS is to be shipped as closed software, one of these has to happen:
+
+- buy a commercial licence for PyMuPDF from Artifex, and replace EbookLib and
+  the espeak-ng phonemizer with permissively licensed or in-house equivalents;
+- or ship ZenTTS as source that installs those dependencies from PyPI on the
+  user's machine, where the combination happens on their side rather than in a
+  distribution made by the author; this is the current arrangement and is the
+  weaker position of the two.
