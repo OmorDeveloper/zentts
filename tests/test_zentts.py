@@ -9,6 +9,7 @@ import hashlib
 import io
 import re
 import sys
+import urllib.error
 from pathlib import Path
 
 import numpy as np
@@ -380,6 +381,111 @@ def test_clean_title_drops_zero_width_spaces(tmp_path):
 
 
 ##############################################################################
+# OpenAI-compatible server
+##############################################################################
+
+
+def test_openai_aliases_point_at_real_voice_ids():
+    for alias, voice in zentts.OPENAI_VOICE_ALIASES.items():
+        assert voice.startswith(zentts.VOICE_PREFIXES), alias
+
+
+def test_server_formats_cover_the_openai_set():
+    assert {"mp3", "wav", "flac", "opus", "pcm"} <= set(zentts.SERVER_FORMATS)
+
+
+def test_server_answers_to_the_openai_model_ids():
+    assert "tts-1" in zentts.SERVER_MODELS
+    assert zentts.SERVER_MODELS[0] == "zentts-1"
+
+
+@pytest.mark.parametrize(
+    "response_format, head",
+    [
+        ("wav", b"RIFF"),
+        ("flac", b"fLaC"),
+        ("ogg", b"OggS"),
+        ("opus", b"OggS"),
+    ],
+)
+def test_encode_audio_writes_real_containers(response_format, head):
+    samples = (0.2 * np.sin(np.linspace(0, 400, 12000))).astype(np.float32)
+    audio, content_type = zentts.encode_audio(samples, 24000, response_format)
+    assert audio.startswith(head)
+    assert content_type.startswith("audio/")
+
+
+def test_encode_audio_pcm_is_raw_16_bit():
+    samples = np.array([0.0, 1.0, -1.0], dtype=np.float32)
+    audio, content_type = zentts.encode_audio(samples, 24000, "pcm")
+    assert content_type == "audio/pcm"
+    assert np.frombuffer(audio, dtype="<i2").tolist() == [0, 32767, -32767]
+
+
+def test_encode_audio_clips_out_of_range_samples():
+    samples = np.array([2.0, -2.0], dtype=np.float32)
+    audio, _ = zentts.encode_audio(samples, 24000, "pcm")
+    assert np.frombuffer(audio, dtype="<i2").tolist() == [32767, -32767]
+
+
+def test_encode_audio_rejects_an_unknown_format():
+    with pytest.raises(ValueError, match="aac"):
+        zentts.encode_audio(np.zeros(10, np.float32), 24000, "aac")
+
+
+class _StubEngine:
+    """Enough of the engine to exercise voice resolution."""
+
+    def __init__(self):
+        self.styles = {
+            "zen_us_f10": np.ones((510, 1, 256), dtype=np.float32),
+            "zen_us_m01": np.zeros((510, 1, 256), dtype=np.float32),
+            "zen_us_f08": np.ones((510, 1, 256), dtype=np.float32) * 0.5,
+        }
+
+    def get_voices(self):
+        return sorted(self.styles)
+
+    def get_voice_style(self, name):
+        return self.styles[name]
+
+
+def test_resolve_api_voice_accepts_a_zentts_id():
+    assert zentts.resolve_api_voice("zen_us_f10", _StubEngine()) == "zen_us_f10"
+
+
+def test_resolve_api_voice_accepts_an_openai_name():
+    # "nova" is an OpenAI voice, mapped onto a ZenTTS one.
+    assert zentts.resolve_api_voice("nova", _StubEngine()) == "zen_us_f08"
+
+
+def test_resolve_api_voice_blends():
+    blend = zentts.resolve_api_voice("zen_us_f10:75,zen_us_m01:25", _StubEngine())
+    assert isinstance(blend, np.ndarray)
+    assert blend.flat[0] == pytest.approx(0.75)
+
+
+def test_resolve_api_voice_normalises_blend_weights():
+    blend = zentts.resolve_api_voice("zen_us_f10:3,zen_us_m01:1", _StubEngine())
+    assert blend.flat[0] == pytest.approx(0.75)
+
+
+def test_resolve_api_voice_falls_back_to_the_default():
+    engine = _StubEngine()
+    assert zentts.resolve_api_voice(None, engine) == zentts.DEFAULT_VOICE
+
+
+def test_resolve_api_voice_rejects_an_unknown_name():
+    with pytest.raises(ValueError, match="Unknown voice"):
+        zentts.resolve_api_voice("does_not_exist", _StubEngine())
+
+
+def test_resolve_api_voice_rejects_a_three_way_blend():
+    with pytest.raises(ValueError, match="two"):
+        zentts.resolve_api_voice("zen_us_f10,zen_us_m01,zen_us_f08", _StubEngine())
+
+
+##############################################################################
 # Metadata
 ##############################################################################
 
@@ -493,3 +599,84 @@ def test_engine_streams_chunks(engine):
 
     chunks = asyncio.run(collect())
     assert chunks and all(len(c) > 0 for c in chunks)
+
+
+@pytest.mark.model
+def test_server_serves_speech_end_to_end(engine, tmp_path):
+    """Start a real server on an ephemeral port and drive it over HTTP."""
+    import json as _json
+    import socket
+    import threading
+    import urllib.request
+    from http.server import ThreadingHTTPServer
+
+    handler = type(
+        "TestHandler",
+        (zentts.ZenTTSHandler,),
+        {"engine": engine, "api_key": "test-key", "quiet": True},
+    )
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", port), handler)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{port}"
+
+    def post(payload, key="test-key"):
+        request = urllib.request.Request(
+            f"{base}/v1/audio/speech",
+            data=_json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"}
+            | ({"Authorization": f"Bearer {key}"} if key else {}),
+        )
+        return urllib.request.urlopen(request, timeout=120)
+
+    try:
+        with urllib.request.urlopen(f"{base}/health", timeout=10) as response:
+            assert _json.load(response)["status"] == "ok"
+
+        with urllib.request.urlopen(f"{base}/v1/models", timeout=10) as response:
+            assert "tts-1" in [m["id"] for m in _json.load(response)["data"]]
+
+        with urllib.request.urlopen(f"{base}/", timeout=10) as response:
+            assert "POST /v1/audio/speech" in _json.load(response)["endpoints"]
+
+        # An OpenAI voice name and the default mp3 format.
+        with post({"model": "tts-1", "input": "Hello.", "voice": "nova"}) as response:
+            assert response.headers["Content-Type"] == "audio/mpeg"
+            assert len(response.read()) > 1000
+
+        # A ZenTTS id, wav, and a speed outside the engine's range.
+        with post(
+            {"input": "Hello.", "voice": zentts.DEFAULT_VOICE,
+             "response_format": "wav", "speed": 4.0}
+        ) as response:
+            assert response.headers["Content-Type"] == "audio/wav"
+            assert response.headers["X-ZenTTS-Speed-Clamped"] == "4.0 -> 2.0"
+            assert response.read().startswith(b"RIFF")
+
+        for payload, status in [
+            ({"voice": "nova"}, 400),          # no input
+            ({"input": "x", "voice": "nope"}, 400),
+            ({"input": "x", "response_format": "aac"}, 400),
+            ({"input": "x", "language": "fr-fr"}, 400),
+        ]:
+            with pytest.raises(urllib.error.HTTPError) as excinfo:
+                post(payload)
+            assert excinfo.value.code == status
+            assert "error" in _json.load(excinfo.value)
+
+        with pytest.raises(urllib.error.HTTPError) as excinfo:
+            post({"input": "x"}, key=None)
+        assert excinfo.value.code == 401
+
+        # A rejected request must not corrupt the next one on the connection.
+        with post({"input": "Still working."}) as response:
+            assert len(response.read()) > 1000
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=10)

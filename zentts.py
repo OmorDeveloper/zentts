@@ -12,7 +12,7 @@ Copyright (c) 2026 Omor. All rights reserved.
 Proprietary software - see LICENSE. Third-party notices in NOTICE.md.
 """
 
-__version__ = "1.1.2"
+__version__ = "1.2.0"
 __author__ = "Omor"
 __license__ = "Proprietary"
 __url__ = "https://github.com/OmorDeveloper/zentts"
@@ -25,7 +25,9 @@ import difflib
 import hashlib
 import importlib.metadata
 import importlib.util
+import io
 import itertools
+import json
 import logging
 import os
 import platform
@@ -35,10 +37,12 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import warnings
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 # Third-party imports
@@ -927,6 +931,8 @@ ZenTTS - English text-to-speech from the command line
 Usage: zentts <input_file> [<more_input_files>...] [<output_audio_file>] [options]
 
 Commands:
+    start              Run the OpenAI-compatible speech API server
+                       (see `zentts start --help`)
     -h, --help         Show this help message
     -v, --version      Show the version number
     --help-languages   List all supported languages
@@ -972,11 +978,64 @@ Examples:
     zentts input.txt output.wav --voice "zen_us_f10:60,zen_us_m01:40"
     zentts input.txt --stream --voice "zen_us_m01,zen_us_f10" # 50-50 blend
     zentts --merge-chunks --split-output ./chunks/ --format wav
+    zentts start --port 8000
     zentts --help-voices
     zentts --help-languages
     zentts input.epub --split-output ./chunks/ --debug
     zentts input.txt output.wav --model /path/to/model.onnx --voices /path/to/voices.bin
 """.replace("{cache}", str(model_dir())))
+
+
+def print_server_usage():
+    print("""
+ZenTTS - OpenAI-compatible speech API
+
+Usage: zentts start [options]
+
+Options:
+    --host <str>          Address to bind (default: 127.0.0.1, use 0.0.0.0 to
+                          accept connections from other machines)
+    --port <int>          Port to listen on (default: 8000)
+    --api-key <str>       Require `Authorization: Bearer <key>`; also read from
+                          the ZENTTS_API_KEY environment variable
+    --default-voice <str> Voice used when a request does not name one
+                          (default: """ + DEFAULT_VOICE + """)
+    --lang <str>          Default language: en-us or en-gb
+    --model <path>        Path to the ZenTTS .onnx model file
+    --voices <path>       Path to the ZenTTS voices .bin file
+    --no-cors             Do not send CORS headers
+    --quiet               Do not log requests
+    -h, --help            Show this message
+
+Endpoints:
+    GET  /                  list of endpoints
+    GET  /health            liveness check
+    GET  /v1/models         models this server answers to
+    GET  /v1/voices         ZenTTS voices and their OpenAI aliases
+    POST /v1/audio/speech   generate speech (OpenAI compatible)
+
+POST /v1/audio/speech accepts:
+    input             the text to speak (required)
+    voice             ZenTTS id, OpenAI name, or a blend "a:60,b:40"
+    response_format   mp3, wav, flac, ogg, opus or pcm (default: mp3)
+    speed             0.5 to 2.0, values outside that are clamped
+    language          en-us or en-gb
+    model             accepted and ignored, so any client works
+
+Examples:
+    zentts start
+    zentts start --host 0.0.0.0 --port 8080
+    zentts start --api-key secret --default-voice zen_uk_f02
+
+    curl http://127.0.0.1:8000/v1/audio/speech \
+      -H "Content-Type: application/json" \
+      -d '{"input": "Hello.", "voice": "zen_us_f10"}' --output hello.mp3
+
+Point any OpenAI client at it:
+    from openai import OpenAI
+    client = OpenAI(base_url="http://127.0.0.1:8000/v1", api_key="not-needed")
+    client.audio.speech.create(model="tts-1", voice="nova", input="Hello.")
+""")
 
 
 def print_supported_languages(model_path=None, voices_path=None):
@@ -2113,7 +2172,437 @@ def get_valid_options():
         "--voices",
         "-v",
         "--version",
+        "--host",
+        "--port",
+        "--api-key",
+        "--default-voice",
+        "--no-cors",
+        "--quiet",
     }
+
+
+##############################################################################
+# HTTP server (OpenAI-compatible)
+##############################################################################
+
+# Default address for `zentts start`.
+SERVER_HOST = "127.0.0.1"
+SERVER_PORT = 8000
+
+# The model ids this server answers to. Anything else is accepted too, so a
+# client hard-coded to "tts-1" keeps working.
+SERVER_MODELS = ["zentts-1", "tts-1", "tts-1-hd", "gpt-4o-mini-tts"]
+
+# OpenAI voice names mapped onto their closest ZenTTS voice, so a client
+# written against the OpenAI API needs no changes.
+OPENAI_VOICE_ALIASES = {
+    "alloy": "zen_us_f01",
+    "ash": "zen_us_m01",
+    "ballad": "zen_uk_m03",
+    "coral": "zen_us_f06",
+    "echo": "zen_us_m02",
+    "fable": "zen_uk_m02",
+    "nova": "zen_us_f08",
+    "onyx": "zen_us_m07",
+    "sage": "zen_us_f09",
+    "shimmer": "zen_us_f11",
+    "verse": "zen_us_m05",
+}
+
+# Largest request body accepted, so a bad client cannot exhaust memory.
+MAX_REQUEST_BYTES = 10 * 1024 * 1024
+
+# response_format -> (soundfile format, subtype, content type)
+SERVER_FORMATS = {
+    "mp3": ("MP3", None, "audio/mpeg"),
+    "wav": ("WAV", None, "audio/wav"),
+    "flac": ("FLAC", None, "audio/flac"),
+    "ogg": ("OGG", "VORBIS", "audio/ogg"),
+    "opus": ("OGG", "OPUS", "audio/ogg"),
+    "pcm": (None, None, "audio/pcm"),  # raw 24 kHz 16-bit mono, like OpenAI
+}
+
+
+def resolve_api_voice(name, engine):
+    """Turn a requested voice into something the engine accepts.
+
+    Accepts a ZenTTS id, an OpenAI voice name, or a blend such as
+    "zen_us_f10:60,zen_us_m01:40".
+    """
+    name = (name or DEFAULT_VOICE).strip()
+    available = set(engine.get_voices())
+
+    if "," in name:
+        voices, weights = [], []
+        for pair in name.split(","):
+            if ":" in pair:
+                voice, weight = pair.strip().split(":", 1)
+                voices.append(OPENAI_VOICE_ALIASES.get(voice.strip(), voice.strip()))
+                weights.append(float(weight))
+            else:
+                alias = pair.strip()
+                voices.append(OPENAI_VOICE_ALIASES.get(alias, alias))
+                weights.append(50.0)
+
+        if len(voices) != 2:
+            raise ValueError("Blending takes exactly two comma separated voices")
+        for voice in voices:
+            if voice not in available:
+                raise ValueError(f"Unknown voice: {voice}")
+
+        total = sum(weights) or 100.0
+        weights = [w * (100 / total) for w in weights]
+        first = engine.get_voice_style(voices[0])
+        second = engine.get_voice_style(voices[1])
+        return np.add(first * (weights[0] / 100), second * (weights[1] / 100))
+
+    voice = OPENAI_VOICE_ALIASES.get(name, name)
+    if voice not in available:
+        raise ValueError(
+            f"Unknown voice: {name}. Use a ZenTTS id such as {DEFAULT_VOICE}, or an "
+            f"OpenAI name such as {', '.join(sorted(OPENAI_VOICE_ALIASES)[:4])}."
+        )
+    return voice
+
+
+def encode_audio(samples, sample_rate, response_format):
+    """Encode samples in the requested format, returning bytes and its type."""
+    if response_format not in SERVER_FORMATS:
+        raise ValueError(
+            f"Unsupported response_format: {response_format}. "
+            f"Supported: {', '.join(sorted(SERVER_FORMATS))}"
+        )
+
+    sound_format, subtype, content_type = SERVER_FORMATS[response_format]
+    samples = np.asarray(samples, dtype=np.float32)
+
+    if sound_format is None:  # raw PCM, 16-bit little-endian
+        clipped = np.clip(samples, -1.0, 1.0)
+        return (clipped * 32767).astype("<i2").tobytes(), content_type
+
+    buffer = io.BytesIO()
+    kwargs = {"subtype": subtype} if subtype else {}
+    sf.write(buffer, samples, sample_rate, format=sound_format, **kwargs)
+    return buffer.getvalue(), content_type
+
+
+def synthesize(engine, text, voice, speed=1.0, lang="en-us"):
+    """Synthesise text for the API, splitting long input into chunks."""
+    pieces = []
+    for chunk in chunk_text(text, initial_chunk_size=1000) or [text]:
+        samples, _ = engine.create(chunk, voice=voice, speed=speed, lang=lang)
+        if len(samples):
+            pieces.append(samples)
+
+    if not pieces:
+        return np.zeros(0, dtype=np.float32), SAMPLE_RATE
+    return np.concatenate(pieces), SAMPLE_RATE
+
+
+class ZenTTSHandler(BaseHTTPRequestHandler):
+    """Serves the OpenAI-compatible endpoints."""
+
+    server_version = f"ZenTTS/{__version__}"
+    protocol_version = "HTTP/1.1"
+
+    # Replaced by run_server.
+    engine = None
+    api_key = None
+    default_voice = DEFAULT_VOICE
+    default_lang = "en-us"
+    allow_cors = True
+    quiet = False
+
+    def log_message(self, format, *args):
+        if not self.quiet:
+            message = format % args
+            sys.stderr.write(
+                f"{self.log_date_time_string()} {self.address_string()} {message}\n"
+            )
+
+    def _send(self, status, body=b"", content_type="application/json", extra=None):
+        if isinstance(body, str):
+            body = body.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        if self.allow_cors:
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header(
+                "Access-Control-Allow-Headers", "Authorization, Content-Type"
+            )
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        for key, value in (extra or {}).items():
+            self.send_header(key, value)
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def _send_json(self, status, payload, extra=None):
+        self._send(status, json.dumps(payload, indent=2), "application/json", extra)
+
+    def _drain_body(self):
+        """Discard an unread request body, so keep-alive stays in sync.
+
+        Without this, replying before reading the body leaves those bytes in
+        the socket, and the next request on the connection is parsed from the
+        middle of the old one. Draining a body that was already read would
+        block until the client gives up, so this is a no-op in that case.
+        """
+        if getattr(self, "_body_read", False):
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        remaining = min(length, MAX_REQUEST_BYTES)
+        while remaining > 0:
+            chunk = self.rfile.read(min(remaining, 65536))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+
+    def _send_error(self, status, message, kind="invalid_request_error"):
+        # Shaped like an OpenAI error, so existing clients can read it.
+        self._drain_body()
+        self._send_json(status, {"error": {"message": message, "type": kind}})
+
+    def _authorized(self):
+        if not self.api_key:
+            return True
+        header = self.headers.get("Authorization", "")
+        return header.startswith("Bearer ") and header[7:].strip() == self.api_key
+
+    def do_OPTIONS(self):
+        self._send(204)
+
+    def do_HEAD(self):
+        self.do_GET()
+
+    def do_GET(self):
+        path = urllib.parse.urlparse(self.path).path.rstrip("/") or "/"
+
+        if path == "/":
+            self._send_json(200, self._index())
+        elif path in ("/health", "/healthz"):
+            self._send_json(200, {"status": "ok", "version": __version__})
+        elif path in ("/v1/models", "/models"):
+            self._send_json(
+                200,
+                {
+                    "object": "list",
+                    "data": [
+                        {"id": name, "object": "model", "owned_by": "zentts"}
+                        for name in SERVER_MODELS
+                    ],
+                },
+            )
+        elif path in ("/v1/voices", "/voices"):
+            if not self._authorized():
+                return self._send_error(401, "Invalid API key", "authentication_error")
+            self._send_json(200, self._voices())
+        else:
+            self._send_error(404, f"Unknown endpoint: {path}", "not_found_error")
+
+    def do_POST(self):
+        self._body_read = False
+        path = urllib.parse.urlparse(self.path).path.rstrip("/") or "/"
+        if path not in ("/v1/audio/speech", "/audio/speech"):
+            return self._send_error(404, f"Unknown endpoint: {path}", "not_found_error")
+
+        if not self._authorized():
+            return self._send_error(401, "Invalid API key", "authentication_error")
+
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            return self._send_error(400, "Invalid Content-Length")
+
+        if length <= 0:
+            return self._send_error(400, "Request body is empty")
+
+        if length > MAX_REQUEST_BYTES:
+            self.close_connection = True
+            return self._send_error(
+                413, f"Request body is larger than {MAX_REQUEST_BYTES} bytes"
+            )
+
+        raw = self.rfile.read(length)
+        self._body_read = True
+
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as e:
+            return self._send_error(400, f"Body must be JSON: {e}")
+
+        if not isinstance(payload, dict):
+            return self._send_error(400, "Body must be a JSON object")
+
+        text = payload.get("input") or payload.get("text") or ""
+        if not str(text).strip():
+            return self._send_error(400, "Field 'input' is required")
+
+        response_format = str(payload.get("response_format", "mp3")).lower()
+        lang = str(payload.get("language") or payload.get("lang") or self.default_lang)
+        if lang not in SUPPORTED_LANGUAGES:
+            return self._send_error(
+                400,
+                f"Unsupported language: {lang}. "
+                f"ZenTTS speaks {', '.join(SUPPORTED_LANGUAGES)}.",
+            )
+
+        try:
+            speed = float(payload.get("speed", 1.0))
+        except (TypeError, ValueError):
+            return self._send_error(400, "Field 'speed' must be a number")
+
+        # OpenAI accepts 0.25 to 4.0; the engine handles 0.5 to 2.0.
+        clamped = min(max(speed, 0.5), 2.0)
+
+        try:
+            voice = resolve_api_voice(
+                payload.get("voice") or self.default_voice, self.engine
+            )
+            samples, rate = synthesize(self.engine, str(text), voice, clamped, lang)
+            audio, content_type = encode_audio(samples, rate, response_format)
+        except ValueError as e:
+            return self._send_error(400, str(e))
+        except Exception as e:
+            log.exception("Synthesis failed")
+            return self._send_error(500, f"Synthesis failed: {e}", "server_error")
+
+        headers = {"X-ZenTTS-Sample-Rate": str(rate)}
+        if clamped != speed:
+            headers["X-ZenTTS-Speed-Clamped"] = f"{speed} -> {clamped}"
+        self._send(200, audio, content_type, headers)
+
+    def _voices(self):
+        return {
+            "object": "list",
+            "default": self.default_voice,
+            "data": [
+                {
+                    "id": voice,
+                    "object": "voice",
+                    "description": voice_label(voice),
+                    "language": VOICE_GROUP_LANGUAGE[
+                        next(p for p in VOICE_PREFIXES if voice.startswith(p))
+                    ],
+                }
+                for voice in self.engine.get_voices()
+            ],
+            "openai_aliases": OPENAI_VOICE_ALIASES,
+        }
+
+    def _index(self):
+        return {
+            "name": "ZenTTS",
+            "version": __version__,
+            "author": __author__,
+            "url": __url__,
+            "openai_compatible": True,
+            "endpoints": {
+                "GET /": "this list of endpoints",
+                "GET /health": "liveness check",
+                "GET /v1/models": "models this server answers to",
+                "GET /v1/voices": "ZenTTS voices and their OpenAI aliases",
+                "POST /v1/audio/speech": "generate speech (OpenAI compatible)",
+            },
+            "speech_request": {
+                "input": "the text to speak (required)",
+                "voice": f"ZenTTS id, OpenAI name, or a blend (default {self.default_voice})",
+                "response_format": sorted(SERVER_FORMATS),
+                "speed": "0.5 to 2.0, values outside are clamped",
+                "language": list(SUPPORTED_LANGUAGES),
+                "model": "accepted and ignored, any id works",
+            },
+            "authentication": "Bearer token required" if self.api_key else "none",
+        }
+
+
+def run_server(
+    host=SERVER_HOST,
+    port=SERVER_PORT,
+    model_path=None,
+    voices_path=None,
+    api_key=None,
+    default_voice=DEFAULT_VOICE,
+    lang="en-us",
+    cors=True,
+    quiet=False,
+):
+    """Start the OpenAI-compatible HTTP server."""
+    engine = load_engine(model_path, voices_path)
+
+    if default_voice not in engine.get_voices():
+        resolved = OPENAI_VOICE_ALIASES.get(default_voice)
+        if resolved not in engine.get_voices():
+            print(f"Error: unknown default voice: {default_voice}")
+            sys.exit(1)
+        default_voice = resolved
+
+    handler = type(
+        "ConfiguredZenTTSHandler",
+        (ZenTTSHandler,),
+        {
+            "engine": engine,
+            "api_key": api_key,
+            "default_voice": default_voice,
+            "default_lang": lang,
+            "allow_cors": cors,
+            "quiet": quiet,
+        },
+    )
+
+    try:
+        httpd = ThreadingHTTPServer((host, port), handler)
+    except OSError as e:
+        print(f"Error: cannot listen on {host}:{port} ({e})")
+        sys.exit(1)
+
+    reachable = "127.0.0.1" if host in ("0.0.0.0", "") else host
+    base = f"http://{reachable}:{port}"
+
+    print(f"\nZenTTS {__version__} - OpenAI-compatible speech API")
+    print(f"Listening on {base}\n")
+    print("Endpoints:")
+    print(f"  GET  {base}/                  this list of endpoints")
+    print(f"  GET  {base}/health            liveness check")
+    print(f"  GET  {base}/v1/models         models this server answers to")
+    print(f"  GET  {base}/v1/voices         voices and OpenAI aliases")
+    print(f"  POST {base}/v1/audio/speech   generate speech")
+    print(f"\nVoices:  {len(engine.get_voices())} English, default {default_voice}")
+    print(f"Formats: {', '.join(sorted(SERVER_FORMATS))}")
+    print(f"Auth:    {'Bearer token required' if api_key else 'none (local use)'}")
+    print("\nQuick test:")
+    print(f"  curl {base}/v1/audio/speech -H 'Content-Type: application/json' \\")
+    print('    -d \'{"input": "Hello from ZenTTS.", "voice": "' + default_voice + '"}\' \\')
+    print("    --output hello.mp3")
+    print("\nPress Ctrl+C to stop.\n")
+    sys.stdout.flush()
+
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\nStopping...")
+    finally:
+        httpd.server_close()
+
+
+# Options that consume the argument after them.
+OPTIONS_WITH_VALUES = {
+    "--speed",
+    "--lang",
+    "--voice",
+    "--split-output",
+    "--format",
+    "--model",
+    "--voices",
+    "--host",
+    "--port",
+    "--api-key",
+    "--default-voice",
+}
 
 
 def split_positionals(argv, format="wav"):
@@ -2126,15 +2615,6 @@ def split_positionals(argv, format="wav"):
         zentts part1.txt part2.txt book.wav   -> 2 inputs, 1 output
         zentts part1.txt part2.txt            -> 2 inputs, output derived
     """
-    takes_value = {
-        "--speed",
-        "--lang",
-        "--voice",
-        "--split-output",
-        "--format",
-        "--model",
-        "--voices",
-    }
     audio_suffixes = (".wav", ".mp3")
 
     positionals = []
@@ -2143,7 +2623,7 @@ def split_positionals(argv, format="wav"):
         if skip:
             skip = False
             continue
-        if arg in takes_value:
+        if arg in OPTIONS_WITH_VALUES:
             skip = True
             continue
         if arg.startswith("-") and arg not in ("-",):
@@ -2177,9 +2657,54 @@ def _read_model_options(argv):
     return model_path, voices_path
 
 
+def _option_value(argv, name, default=None):
+    """Read the value that follows an option, if it is there."""
+    for i, arg in enumerate(argv):
+        if arg == name and i + 1 < len(argv):
+            return argv[i + 1]
+    return default
+
+
+def start_command(argv):
+    """Handle `zentts start`, which runs the OpenAI-compatible API server."""
+    if "--help" in argv or "-h" in argv:
+        print_server_usage()
+        sys.exit(0)
+
+    port = _option_value(argv, "--port", str(SERVER_PORT))
+    try:
+        port = int(port)
+    except ValueError:
+        print(f"Error: --port must be a number, got {port}")
+        sys.exit(1)
+
+    model_path, voices_path = _read_model_options(argv)
+    lang = _option_value(argv, "--lang", "en-us")
+    if lang not in SUPPORTED_LANGUAGES:
+        print(f"Error: unsupported language: {lang}")
+        print(f"ZenTTS speaks {', '.join(SUPPORTED_LANGUAGES)}")
+        sys.exit(1)
+
+    run_server(
+        host=_option_value(argv, "--host", SERVER_HOST),
+        port=port,
+        model_path=model_path,
+        voices_path=voices_path,
+        api_key=_option_value(argv, "--api-key") or os.getenv("ZENTTS_API_KEY"),
+        default_voice=_option_value(argv, "--default-voice", DEFAULT_VOICE),
+        lang=lang,
+        cors="--no-cors" not in argv,
+        quiet="--quiet" in argv,
+    )
+
+
 def main():
     """Main entry point for the zentts CLI tool."""
     stdin_indicators = ["/dev/stdin", "-", "CONIN$"]
+
+    if len(sys.argv) > 1 and sys.argv[1] in ("start", "serve"):
+        start_command(sys.argv[2:])
+        return
 
     valid_options = get_valid_options()
 
@@ -2189,15 +2714,7 @@ def main():
         arg = sys.argv[i]
         if arg.startswith("--") and arg not in valid_options:
             unknown_options.append(arg)
-        elif arg in {
-            "--speed",
-            "--lang",
-            "--voice",
-            "--split-output",
-            "--format",
-            "--model",
-            "--voices",
-        }:
+        elif arg in OPTIONS_WITH_VALUES:
             i += 1
         i += 1
 

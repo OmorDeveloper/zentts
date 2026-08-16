@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.2.0
+
+- **`zentts start` runs an OpenAI-compatible speech API server.** Point any
+  OpenAI client at `http://127.0.0.1:8000/v1` and it works unchanged; the
+  official Python SDK is tested against it. Built on the standard library, so
+  it adds no dependencies.
+  - `POST /v1/audio/speech` with `input`, `voice`, `response_format`, `speed`
+    and `language`
+  - `GET /`, `/health`, `/v1/models`, `/v1/voices`
+  - Formats: mp3, wav, flac, ogg, opus and raw pcm
+  - OpenAI voice names (`nova`, `onyx`, `fable`, …) map onto ZenTTS voices,
+    and voice blending works over the API too
+  - Optional bearer-token auth via `--api-key` or `ZENTTS_API_KEY`, CORS on by
+    default, request bodies capped at 10 MB
+- A speed outside the engine's range is clamped rather than refused, and the
+  response reports it in `X-ZenTTS-Speed-Clamped`.
+
 ## 1.1.2
 
 - `--version` now prints the author and copyright line alongside the version.

@@ -107,6 +107,80 @@ zentts input.txt out.wav --voice "zen_us_f10:60,zen_us_m01:40"
 zentts input.txt out.wav --voice "zen_us_m01,zen_us_f10"   # 50-50
 ```
 
+## Run it as an API server
+
+`zentts start` serves an **OpenAI-compatible speech API**, so anything already
+written against OpenAI's text-to-speech works against your own machine with a
+one-line change. No extra dependencies — the server is part of the package.
+
+```bash
+zentts start                                   # http://127.0.0.1:8000
+zentts start --host 0.0.0.0 --port 8080        # reachable on your network
+zentts start --api-key secret                  # require a bearer token
+zentts start --default-voice zen_uk_f02
+```
+
+### Endpoints
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/` | lists every endpoint and the accepted fields |
+| `GET` | `/health` | liveness check |
+| `GET` | `/v1/models` | models this server answers to |
+| `GET` | `/v1/voices` | ZenTTS voices with their OpenAI aliases |
+| `POST` | `/v1/audio/speech` | generate speech |
+
+### Generating speech
+
+```bash
+curl http://127.0.0.1:8000/v1/audio/speech   -H "Content-Type: application/json"   -d '{"input": "Hello from ZenTTS.", "voice": "zen_us_f10"}'   --output hello.mp3
+```
+
+| Field | Meaning |
+| --- | --- |
+| `input` | the text to speak (required) |
+| `voice` | ZenTTS id, OpenAI name, or a blend `"zen_us_f10:60,zen_us_m01:40"` |
+| `response_format` | `mp3` (default), `wav`, `flac`, `ogg`, `opus`, `pcm` |
+| `speed` | `0.5`–`2.0`; values outside are clamped, and the response says so |
+| `language` | `en-us` or `en-gb` |
+| `model` | accepted and ignored, so any client works |
+
+### Using an OpenAI client
+
+Point the base URL at ZenTTS and nothing else changes:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8000/v1", api_key="not-needed")
+
+response = client.audio.speech.create(
+    model="tts-1",          # any model id is accepted
+    voice="nova",           # OpenAI names map onto ZenTTS voices
+    input="Running locally, with no API bill.",
+)
+response.stream_to_file("hello.mp3")
+```
+
+OpenAI voice names are mapped to their closest ZenTTS voice: `alloy`, `ash`,
+`ballad`, `coral`, `echo`, `fable`, `nova`, `onyx`, `sage`, `shimmer` and
+`verse`. You can also pass ZenTTS ids directly.
+
+### Server options
+
+| Option | Description |
+| --- | --- |
+| `--host` | address to bind (default `127.0.0.1`) |
+| `--port` | port to listen on (default `8000`) |
+| `--api-key` | require `Authorization: Bearer <key>`; or set `ZENTTS_API_KEY` |
+| `--default-voice` | voice used when a request does not name one |
+| `--lang` | default language |
+| `--model` / `--voices` | paths to the model files |
+| `--no-cors` | do not send CORS headers |
+| `--quiet` | do not log requests |
+
+Run `zentts start --help` for the full list.
+
 ## Multiple input files
 
 Pass as many inputs as you like and they are joined, in order, into one output
