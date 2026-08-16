@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.3.2
+
+- **Python 3.13 supported.** The `requires-python` bound is now `>=3.11` with no
+  upper limit, so `pip install zentts` works on Python 3.13 and future releases.
+  CI runs the test suite on 3.11, 3.12 and 3.13 across Linux, Windows and macOS.
+
 ## 1.3.1
 
 - **Security hardening.** License control URLs are no longer exposed at module
