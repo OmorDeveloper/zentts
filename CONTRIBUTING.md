@@ -56,7 +56,19 @@ Use the pull request template — it prompts for everything reviewers need.
 
 ## Testing
 
-There is no automated test suite yet, so test by hand what your change touches:
+Run the suite before sending a change:
+
+```bash
+pip install pytest
+pytest tests/ -v
+```
+
+The tests marked `model` need the model files and skip themselves when those
+are missing, so `pytest -m "not model"` is the quick pass and a full run after
+`zentts --download` is the thorough one. CI runs the suite on Linux, Windows
+and macOS for Python 3.11 and 3.12.
+
+Then test by hand whatever your change touches:
 
 - plain `.txt` input to `.wav` and `.mp3`
 - EPUB and PDF chapter extraction

@@ -852,15 +852,26 @@ def chunk_text(text, initial_chunk_size=1000):
         sentence_size = len(sentence)
 
         if sentence_size > chunk_size:
+            # Emit what is already queued first, or the long sentence would be
+            # spoken before the sentences that come before it.
+            if current_chunk:
+                chunks.append(" ".join(current_chunk))
+                current_chunk = []
+                current_size = 0
+
             words = sentence.split()
             current_piece = []
             current_piece_size = 0
+
+            def flush(piece):
+                text = " ".join(piece).strip()
+                chunks.append(text if text.endswith(".") else text + ".")
 
             for word in words:
                 word_size = len(word) + 1
                 if current_piece_size + word_size > chunk_size:
                     if current_piece:
-                        chunks.append(" ".join(current_piece).strip() + ".")
+                        flush(current_piece)
                     current_piece = [word]
                     current_piece_size = word_size
                 else:
@@ -868,7 +879,7 @@ def chunk_text(text, initial_chunk_size=1000):
                     current_piece_size += word_size
 
             if current_piece:
-                chunks.append(" ".join(current_piece).strip() + ".")
+                flush(current_piece)
             continue
 
         if current_size + sentence_size > chunk_size and current_chunk:
